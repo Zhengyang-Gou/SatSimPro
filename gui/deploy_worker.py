@@ -52,6 +52,8 @@ class RemoteDeployWorker(QObject):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 **self._popen_process_group_kwargs(),
             )
             output, _ = self._process.communicate(

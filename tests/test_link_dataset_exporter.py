@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import unittest
 from datetime import datetime
@@ -40,3 +41,21 @@ class LinkDatasetExporterTests(unittest.TestCase):
                 "brA10102_1-brA10101_2",
                 lines,
             )
+
+            endpoint_neighbors = {}
+            for line in lines:
+                match = re.search(r"S(\d+)_(\d+)-S(\d+)_(\d+)", line)
+                self.assertIsNotNone(match)
+
+                left_sat, left_port, right_sat, right_port = match.groups()
+                left_endpoint = (left_sat, left_port)
+                right_endpoint = (right_sat, right_port)
+                endpoint_neighbors.setdefault(left_endpoint, set()).add(right_endpoint)
+                endpoint_neighbors.setdefault(right_endpoint, set()).add(left_endpoint)
+
+            reused_ports = {
+                endpoint: neighbors
+                for endpoint, neighbors in endpoint_neighbors.items()
+                if len(neighbors) > 1
+            }
+            self.assertEqual(reused_ports, {})
