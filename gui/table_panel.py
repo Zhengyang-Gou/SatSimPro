@@ -3,7 +3,7 @@
 from typing import List, Optional, Set
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
@@ -29,12 +29,14 @@ class LinkTablePanel(QWidget):
 
     def __init__(self, page_size: int = 10, parent=None):
         super().__init__(parent)
+        self.setObjectName("linkTablePanel")
         self.page_size = page_size
         self.current_page = 1
         self.records: List[LinkRecord] = []
         self.active_count: Optional[int] = None
         self.selected_link_pairs: Set[LinkKey] = set()
         self.redis_in_flight = False
+        self.redis_enabled = False
         self.redis_last_error = ""
         self._filter_cache_query = ""
         self._filter_cache_records_id = 0
@@ -44,8 +46,8 @@ class LinkTablePanel(QWidget):
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(16, 12, 16, 14)
+        layout.setSpacing(9)
         layout.addLayout(self._build_toolbar())
 
         self.table = self._create_table()
@@ -54,22 +56,28 @@ class LinkTablePanel(QWidget):
 
     def _build_toolbar(self) -> QHBoxLayout:
         toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
+        toolbar.setSpacing(10)
+
+        title = QLabel("链路详情")
+        title.setObjectName("panelTitle")
 
         self.txt_search = QLineEdit()
-        self.txt_search.setPlaceholderText("筛选链路，例如 10101 或 10101-10102")
-        self.txt_search.setMinimumWidth(320)
+        self.txt_search.setPlaceholderText("搜索卫星或链路 ID")
+        self.txt_search.setClearButtonEnabled(True)
+        self.txt_search.setMinimumWidth(280)
+        self.txt_search.setMaximumWidth(420)
         self.txt_search.textChanged.connect(self._on_search_changed)
 
-        self.lbl_active_chip = QLabel("活动 0")
+        self.lbl_active_chip = QLabel("● 0 活动")
         self.lbl_active_chip.setObjectName("activeChip")
 
-        self.lbl_total_chip = QLabel("总数 0")
+        self.lbl_total_chip = QLabel("0 条链路")
         self.lbl_total_chip.setObjectName("metricChip")
 
-        self.lbl_redis_chip = QLabel("Redis 空闲")
+        self.lbl_redis_chip = QLabel("● Redis 空闲")
         self.lbl_redis_chip.setObjectName("redisChip")
 
+        toolbar.addWidget(title)
         toolbar.addWidget(self.txt_search)
         toolbar.addStretch()
         toolbar.addWidget(self.lbl_active_chip)
@@ -80,14 +88,28 @@ class LinkTablePanel(QWidget):
     def _create_table(self) -> QTableWidget:
         table = QTableWidget(0, len(TABLE_HEADERS))
 
-        table_font = QFont("Consolas", 10)
-        table_font.setStyleHint(QFont.Monospace)
+        available_fonts = set(QFontDatabase.families())
+        table_family = next(
+            (
+                family
+                for family in (
+                    "SF Pro Text",
+                    "PingFang SC",
+                    "Microsoft YaHei UI",
+                    "Noto Sans SC",
+                    "Segoe UI",
+                )
+                if family in available_fonts
+            ),
+            "sans-serif",
+        )
+        table_font = QFont(table_family, 10)
         table.setFont(table_font)
 
         table.setAlternatingRowColors(True)
         table.setHorizontalHeaderLabels(TABLE_HEADERS)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        table.verticalHeader().setDefaultSectionSize(38)
+        table.verticalHeader().setDefaultSectionSize(36)
         table.verticalHeader().setVisible(False)
 
         table.setItemDelegateForColumn(3, LatencyDelegate(25.0, table))
@@ -108,12 +130,14 @@ class LinkTablePanel(QWidget):
         page_layout.setSpacing(8)
 
         self.btn_prev = QPushButton("上一页")
+        self.btn_prev.setObjectName("pageButton")
         self.btn_prev.clicked.connect(lambda: self.change_page(-1))
 
         self.lbl_page = QLabel("第 1 / 1 页")
         self.lbl_page.setObjectName("metricChip")
 
         self.btn_next = QPushButton("下一页")
+        self.btn_next.setObjectName("pageButton")
         self.btn_next.clicked.connect(lambda: self.change_page(1))
 
         page_layout.addStretch()
@@ -129,6 +153,7 @@ class LinkTablePanel(QWidget):
         self.selected_link_pairs.clear()
         self.current_page = 1
         self.redis_in_flight = False
+        self.redis_enabled = False
         self.redis_last_error = ""
         self._invalidate_filter_cache()
         self.refresh()
@@ -138,6 +163,7 @@ class LinkTablePanel(QWidget):
         records: List[LinkRecord],
         *,
         redis_in_flight: bool = False,
+        redis_enabled: bool = False,
         redis_last_error: str = "",
         active_count: Optional[int] = None,
     ) -> None:
@@ -146,6 +172,7 @@ class LinkTablePanel(QWidget):
         self.records = records
         self.active_count = active_count
         self.redis_in_flight = redis_in_flight
+        self.redis_enabled = redis_enabled
         self.redis_last_error = redis_last_error
         self.refresh()
 
@@ -235,15 +262,21 @@ class LinkTablePanel(QWidget):
     def _update_summary_chips(self) -> None:
         active_count = self._active_count()
         total_count = len(self.records)
-        self.lbl_active_chip.setText(f"活动 {active_count}")
-        self.lbl_total_chip.setText(f"总数 {total_count}")
+        self.lbl_active_chip.setText(f"● {active_count} 活动")
+        self.lbl_total_chip.setText(f"{total_count} 条链路")
 
         if self.redis_last_error:
-            self.lbl_redis_chip.setText("Redis 异常")
+            self.lbl_redis_chip.setText("● Redis 异常")
+            self.lbl_redis_chip.setStyleSheet("color: #ff453a;")
         elif self.redis_in_flight:
-            self.lbl_redis_chip.setText("Redis 更新中")
+            self.lbl_redis_chip.setText("● Redis 更新中")
+            self.lbl_redis_chip.setStyleSheet("color: #ff9f0a;")
+        elif self.redis_enabled:
+            self.lbl_redis_chip.setText("● Redis 已连接")
+            self.lbl_redis_chip.setStyleSheet("color: #30d158;")
         else:
-            self.lbl_redis_chip.setText("Redis 空闲")
+            self.lbl_redis_chip.setText("● Redis 未连接")
+            self.lbl_redis_chip.setStyleSheet("color: #98989d;")
 
     def _ensure_table_row(self, row: int) -> None:
         for col in range(len(TABLE_HEADERS)):

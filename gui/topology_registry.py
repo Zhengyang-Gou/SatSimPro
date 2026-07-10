@@ -34,6 +34,7 @@ class TopologyRegistry:
 
         if isinstance(strategy, GridDeltaStrategy):
             strategy.static_edges = None
+            strategy._static_edge_pairs = None
 
     def build_if_needed(self, strategy: Any, satellites: List[Any]) -> None:
         if self.is_locked:

@@ -4,18 +4,40 @@ import os
 from typing import Any, Dict, List, Optional
 
 
-def env_int(name: str, default: int) -> int:
+def env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
     try:
-        return int(os.getenv(name, str(default)))
+        value = int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
-        return default
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
 
 
-def env_float(name: str, default: float) -> float:
+def env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
     try:
-        return float(os.getenv(name, str(default)))
+        value = float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
-        return default
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
 
 
 def env_str(name: str, default: str) -> str:
@@ -33,22 +55,22 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 DEFAULT_REDIS_HOST = env_str("SATNET_REDIS_HOST", "127.0.0.1")
-DEFAULT_REDIS_PORT = env_int("SATNET_REDIS_PORT", 6379)
-DEFAULT_REDIS_DB = env_int("SATNET_REDIS_DB", 0)
+DEFAULT_REDIS_PORT = env_int("SATNET_REDIS_PORT", 6379, minimum=1, maximum=65535)
+DEFAULT_REDIS_DB = env_int("SATNET_REDIS_DB", 0, minimum=0)
 DEFAULT_REDIS_KEY_PREFIX = env_str("SATNET_REDIS_KEY_PREFIX", "data")
 DEFAULT_REDIS_LOSS_ENABLED = env_bool("SATNET_REDIS_LOSS_ENABLED", True)
-DEFAULT_REDIS_LOSS_SCALE = env_float("SATNET_REDIS_LOSS_SCALE", 1.0)
-DEFAULT_REDIS_SOCKET_TIMEOUT = env_float("SATNET_REDIS_SOCKET_TIMEOUT", 0.05)
+DEFAULT_REDIS_LOSS_SCALE = env_float("SATNET_REDIS_LOSS_SCALE", 1.0, minimum=0.0)
+DEFAULT_REDIS_SOCKET_TIMEOUT = env_float("SATNET_REDIS_SOCKET_TIMEOUT", 0.05, minimum=0.001)
 DEFAULT_REMOTE_DEPLOY_SCRIPT = env_str("SATNET_REMOTE_DEPLOY_SCRIPT", "/home/s223/yzy/scripts/deploy.sh")
 DEFAULT_REMOTE_MEASURE_SCRIPT = env_str("SATNET_REMOTE_MEASURE_SCRIPT", "/home/s223/yzy/scripts/measure_slice.sh")
-DEFAULT_REMOTE_PROBE_COUNT = env_int("SATNET_REMOTE_PROBE_COUNT", 5)
-DEFAULT_REMOTE_PROBE_PPS = env_float("SATNET_REMOTE_PROBE_PPS", 10.0)
-DEFAULT_REMOTE_SLICE_DURATION_SEC = env_float("SATNET_REMOTE_SLICE_DURATION_SEC", 10.0)
-DEFAULT_REMOTE_TIME_SLICES = env_int("SATNET_REMOTE_TIME_SLICES", 60)
-DEFAULT_REMOTE_COMMAND_TIMEOUT_SEC = env_float("SATNET_REMOTE_COMMAND_TIMEOUT_SEC", 10.0)
+DEFAULT_REMOTE_PROBE_COUNT = env_int("SATNET_REMOTE_PROBE_COUNT", 5, minimum=1)
+DEFAULT_REMOTE_PROBE_PPS = env_float("SATNET_REMOTE_PROBE_PPS", 10.0, minimum=0.1)
+DEFAULT_REMOTE_SLICE_DURATION_SEC = env_float("SATNET_REMOTE_SLICE_DURATION_SEC", 10.0, minimum=0.1)
+DEFAULT_REMOTE_TIME_SLICES = env_int("SATNET_REMOTE_TIME_SLICES", 60, minimum=1)
+DEFAULT_REMOTE_COMMAND_TIMEOUT_SEC = env_float("SATNET_REMOTE_COMMAND_TIMEOUT_SEC", 10.0, minimum=0.1)
 DEFAULT_SSH_HOST_ALIAS = env_str("SATNET_SSH_HOST_ALIAS", "")
 DEFAULT_SSH_HOST = env_str("SATNET_SSH_HOST", "121.48.163.223")
-DEFAULT_SSH_PORT = env_int("SATNET_SSH_PORT", 22)
+DEFAULT_SSH_PORT = env_int("SATNET_SSH_PORT", 22, minimum=1, maximum=65535)
 DEFAULT_SSH_USERNAME = env_str("SATNET_SSH_USERNAME", "s223")
 DEFAULT_SSH_PRIVATE_KEY = env_str("SATNET_SSH_PRIVATE_KEY", "~/.ssh/id_ed25519_satellite_simulation")
 DEFAULT_REDIS_PASSWORD_FILE = env_str(
@@ -64,7 +86,11 @@ DEFAULT_SUDO_PASSWORD_FILE = env_str(
 def build_ssh_command(remote_command: str, ssh_host_alias: Optional[str] = None) -> List[str]:
     """Build an ssh command that works without requiring a user ssh config alias."""
     alias = DEFAULT_SSH_HOST_ALIAS if ssh_host_alias is None else ssh_host_alias
-    command = ["ssh", "-o", "BatchMode=yes"]
+    command = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+    ]
 
     if alias:
         return command + [alias, remote_command]

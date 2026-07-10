@@ -20,16 +20,16 @@ from PySide6.QtWidgets import (
 
 
 def _configure_form_layout(layout: QFormLayout) -> None:
-    layout.setContentsMargins(18, 18, 18, 18)
-    layout.setHorizontalSpacing(14)
-    layout.setVerticalSpacing(10)
+    layout.setContentsMargins(16, 16, 16, 16)
+    layout.setHorizontalSpacing(16)
+    layout.setVerticalSpacing(11)
     layout.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
     layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
 
 def _configure_box_layout(layout: QVBoxLayout) -> None:
-    layout.setContentsMargins(18, 18, 18, 18)
-    layout.setSpacing(12)
+    layout.setContentsMargins(20, 18, 20, 20)
+    layout.setSpacing(14)
 
 
 def _dialog_buttons(dialog: QDialog) -> QDialogButtonBox:
@@ -57,11 +57,11 @@ class WalkerDialog(QDialog):
 
         self.spin_t = QSpinBox()
         self.spin_t.setRange(1, 10000)
-        self.spin_t.setValue(525)
+        self.spin_t.setValue(1200)
 
         self.spin_p = QSpinBox()
         self.spin_p.setRange(1, 1000)
-        self.spin_p.setValue(15)
+        self.spin_p.setValue(60)
 
         self.spin_f = QSpinBox()
         self.spin_f.setRange(0, 1000)
@@ -69,12 +69,12 @@ class WalkerDialog(QDialog):
 
         self.spin_alt = QDoubleSpinBox()
         self.spin_alt.setRange(100, 20000)
-        self.spin_alt.setValue(550.0)
+        self.spin_alt.setValue(508.0)
         self.spin_alt.setSuffix(" km")
 
         self.spin_inc = QDoubleSpinBox()
         self.spin_inc.setRange(0, 180)
-        self.spin_inc.setValue(53.0)
+        self.spin_inc.setValue(55.0)
         self.spin_inc.setSuffix(" °")
 
         layout.addRow("卫星总数 (T)：", self.spin_t)

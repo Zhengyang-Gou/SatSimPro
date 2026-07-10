@@ -4,13 +4,15 @@ class Strategy:
     def compute_links(self, satellites):
         raise NotImplementedError
 
-    def _format_edges(self, edges, satellites):
+    def _format_edges(self, edges, satellites, *, presorted=False):
         link_stats = []
 
-        if not edges:
+        if edges is None or len(edges) == 0:
             return np.empty((0,), dtype=np.int64), link_stats
 
-        edge_arr = np.asarray(sorted(edges), dtype=np.int64)
+        edge_arr = np.asarray(
+            edges if presorted else sorted(edges), dtype=np.int64
+        ).reshape((-1, 2))
         u_list = edge_arr[:, 0]
         v_list = edge_arr[:, 1]
 
@@ -40,6 +42,7 @@ class Strategy:
 class GridDeltaStrategy(Strategy):
     def __init__(self, latitude_fuse_enabled=False, latitude_threshold=70.0):
         self.static_edges = None
+        self._static_edge_pairs = None
         self.latitude_fuse_enabled = latitude_fuse_enabled
         self.latitude_threshold = latitude_threshold
         
@@ -47,8 +50,11 @@ class GridDeltaStrategy(Strategy):
         if not satellites:
             return np.empty((0,), dtype=np.int64), []
         if self.static_edges is None:
-            self.static_edges = []; P = max(s.plane_idx for s in satellites) + 1; S = max(s.node_idx for s in satellites) + 1
-            get_idx = lambda p, s: (p % P) * S + (s % S)
+            self.static_edges = []
+            P = max(s.plane_idx for s in satellites) + 1
+            S = max(s.node_idx for s in satellites) + 1
+            def get_idx(plane, node):
+                return (plane % P) * S + (node % S)
             for p in range(P):
                 next_plane_positions = np.asarray([
                     satellites[get_idx(p + 1, ns)].position_eci
@@ -66,15 +72,30 @@ class GridDeltaStrategy(Strategy):
                 best_shift = int(np.argmin(shift_costs))
 
                 for s in range(S):
-                    u_idx = get_idx(p, s); self.static_edges.append(('intra', u_idx, get_idx(p, s + 1)))
+                    u_idx = get_idx(p, s)
+                    self.static_edges.append(('intra', u_idx, get_idx(p, s + 1)))
                     self.static_edges.append(('inter', u_idx, get_idx(p + 1, s + best_shift)))
 
-        isl_edges = set()
-        for edge_type, u, v in self.static_edges:
-            if edge_type == 'inter' and self._is_latitude_fused(u, v, satellites):
-                continue
-            isl_edges.add((u, v) if u < v else (v, u))
-        return self._format_edges(isl_edges, satellites)
+            unique_edges = {
+                (u, v) if u < v else (v, u)
+                for _edge_type, u, v in self.static_edges
+            }
+            self._static_edge_pairs = np.asarray(sorted(unique_edges), dtype=np.int64).reshape((-1, 2))
+
+        if not self.latitude_fuse_enabled:
+            return self._format_edges(self._static_edge_pairs, satellites, presorted=True)
+
+        fused_inter_edges = {
+            (u, v) if u < v else (v, u)
+            for edge_type, u, v in self.static_edges
+            if edge_type == 'inter' and self._is_latitude_fused(u, v, satellites)
+        }
+        active_edges = [
+            tuple(edge)
+            for edge in self._static_edge_pairs
+            if tuple(edge) not in fused_inter_edges
+        ]
+        return self._format_edges(active_edges, satellites, presorted=True)
 
     def _is_latitude_fused(self, u, v, satellites):
         if not self.latitude_fuse_enabled:

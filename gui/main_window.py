@@ -1,13 +1,13 @@
 """Main application window after modularizing UI, table, topology, and Redis concerns."""
 
 from datetime import datetime, timedelta
+from pathlib import Path
 from time import monotonic
 from typing import Any, Dict, Optional, Set
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
-    QApplication,
     QDialog,
     QInputDialog,
     QLineEdit,
@@ -15,13 +15,11 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QSplitter,
-    QStyle,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 from core.calculator import OrbitCalculator
-from core.link_dataset_exporter import LinkDatasetExportCancelled, LinkDatasetExporter
 from core.strategies import GridDeltaStrategy
 
 from .config import (
@@ -32,6 +30,7 @@ from .config import (
     sudo_password_from_env_or_file,
 )
 from .deploy_worker import RemoteDeployWorker
+from .export_worker import LinkDatasetExportWorker
 from .dialogs import (
     LinkDatasetExportDialog,
     TopologyDialog,
@@ -54,7 +53,8 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Satellite Simulation")
-        self.resize(1200, 900)
+        self.resize(1280, 860)
+        self.setMinimumSize(980, 700)
         self.setStyleSheet(DARK_THEME)
 
         self.calculator = OrbitCalculator()
@@ -63,15 +63,19 @@ class MainWindow(QMainWindow):
 
         self.redis_config = redis_config_from_env()
         self.redis_enabled = bool(self.redis_config.get("enabled", False))
-        self.redis_query_interval = env_int("SATNET_REDIS_QUERY_INTERVAL", 2)
+        self.redis_query_interval = env_int("SATNET_REDIS_QUERY_INTERVAL", 2, minimum=1)
         self.redis_query_counter = 0
         self.redis_query_seq = 0
         self.redis_query_in_flight = False
         self.redis_last_error = ""
         self.redis_worker_thread: Optional[QThread] = None
         self.redis_worker: Optional[RedisQueryWorker] = None
+        self._retiring_redis_threads: Set[QThread] = set()
         self.deploy_worker_thread: Optional[QThread] = None
         self.deploy_worker: Optional[RemoteDeployWorker] = None
+        self.export_worker_thread: Optional[QThread] = None
+        self.export_worker: Optional[LinkDatasetExportWorker] = None
+        self.export_progress: Optional[QProgressDialog] = None
         self.deploy_completed = False
         self.remote_measure_thread: Optional[QThread] = None
         self.remote_measure_worker: Optional[RemoteMeasureSliceWorker] = None
@@ -92,6 +96,7 @@ class MainWindow(QMainWindow):
         self.current_time = datetime.utcnow()
         self.selected_link_pairs: Set[LinkKey] = set()
         self.current_walker_config: Optional[Dict[str, Any]] = None
+        self._animation_frame = 0
 
         self._init_ui()
         self._init_menu()
@@ -115,50 +120,68 @@ class MainWindow(QMainWindow):
         self.redis_close_requested.connect(self.redis_worker.close)
         self.redis_worker.result_ready.connect(self._apply_redis_result)
         self.redis_worker.error.connect(self._handle_redis_error)
+        self.redis_worker_thread.finished.connect(self.redis_worker.deleteLater)
+        self.redis_worker_thread.finished.connect(self.redis_worker_thread.deleteLater)
+        self.redis_worker_thread.finished.connect(
+            lambda thread=self.redis_worker_thread: self._retiring_redis_threads.discard(thread)
+        )
         self.redis_worker_thread.start()
 
-    def stop_redis_worker(self) -> None:
+    def stop_redis_worker(self, *, wait: bool = False) -> None:
         self.redis_query_seq += 1
         self.redis_query_in_flight = False
 
-        if self.redis_worker is not None:
+        worker = self.redis_worker
+        thread = self.redis_worker_thread
+        self.redis_worker = None
+        self.redis_worker_thread = None
+
+        if worker is not None:
             try:
-                self.redis_query_requested.disconnect(self.redis_worker.query)
+                self.redis_query_requested.disconnect(worker.query)
             except (TypeError, RuntimeError):
                 pass
-
             try:
                 self.redis_close_requested.emit()
             except RuntimeError:
                 pass
+            try:
+                self.redis_close_requested.disconnect(worker.close)
+            except (TypeError, RuntimeError):
+                pass
 
-        if self.redis_worker_thread is not None:
-            if not self.redis_worker_thread.wait(5000):
-                self.redis_worker_thread.quit()
-                self.redis_worker_thread.wait(1500)
+        if thread is not None:
+            self._retiring_redis_threads.add(thread)
 
-        self.redis_worker = None
-        self.redis_worker_thread = None
+        # Normal enable/disable operations return immediately. During final
+        # application shutdown, wait briefly so a running QThread is not destroyed.
+        if wait and thread is not None and not thread.wait(2000):
+            thread.quit()
+            thread.wait(500)
 
     def _init_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("workspace")
         self.setCentralWidget(central)
 
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        splitter = QSplitter(Qt.Vertical)
+        self.workspace_splitter = QSplitter(Qt.Vertical)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.setHandleWidth(1)
 
         self.visualizer = Visualizer()
-        splitter.addWidget(self.visualizer)
+        self.workspace_splitter.addWidget(self.visualizer)
 
         self.table_panel = LinkTablePanel(page_size=10)
         self.table_panel.selection_changed.connect(self._on_selected_links_changed)
-        splitter.addWidget(self.table_panel)
+        self.workspace_splitter.addWidget(self.table_panel)
 
-        splitter.setStretchFactor(0, 6)
-        splitter.setStretchFactor(1, 4)
-        layout.addWidget(splitter)
+        self.workspace_splitter.setStretchFactor(0, 7)
+        self.workspace_splitter.setStretchFactor(1, 3)
+        self.workspace_splitter.setSizes([600, 240])
+        layout.addWidget(self.workspace_splitter)
 
     def _init_menu(self) -> None:
         mb = self.menuBar()
@@ -206,17 +229,28 @@ class MainWindow(QMainWindow):
 
     def _init_toolbar(self) -> None:
         toolbar = QToolBar("主工具栏")
+        toolbar.setObjectName("mainToolbar")
         toolbar.setMovable(False)
-        toolbar.setIconSize(QSize(18, 18))
-        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toolbar.setFloatable(False)
+        toolbar.setIconSize(QSize(17, 17))
+        toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
 
-        style = self.style()
-        self.act_generate_walker.setIcon(style.standardIcon(QStyle.SP_FileDialogNewFolder))
-        self.act_deploy.setIcon(style.standardIcon(QStyle.SP_ComputerIcon))
-        self.act_play.setIcon(style.standardIcon(QStyle.SP_MediaPlay))
-        self.act_step.setIcon(style.standardIcon(QStyle.SP_BrowserReload))
-        self.act_export_dataset.setIcon(style.standardIcon(QStyle.SP_DriveHDIcon))
-        self.act_redis_enable.setIcon(style.standardIcon(QStyle.SP_DriveNetIcon))
+        icon_dir = Path(__file__).resolve().parents[1] / "assets" / "icons"
+        self.icon_play = QIcon(str(icon_dir / "play.svg"))
+        self.icon_stop = QIcon(str(icon_dir / "stop.svg"))
+        self.act_generate_walker.setIcon(QIcon(str(icon_dir / "constellation.svg")))
+        self.act_deploy.setIcon(QIcon(str(icon_dir / "deploy.svg")))
+        self.act_play.setIcon(self.icon_play)
+        self.act_step.setIcon(QIcon(str(icon_dir / "step.svg")))
+        self.act_export_dataset.setIcon(QIcon(str(icon_dir / "export.svg")))
+        self.act_redis_enable.setIcon(QIcon(str(icon_dir / "database.svg")))
+
+        self.act_generate_walker.setToolTip("生成 Walker 星座")
+        self.act_deploy.setToolTip("部署远程仿真环境")
+        self.act_play.setToolTip("开始或停止远程仿真")
+        self.act_step.setToolTip("设置仿真步长")
+        self.act_export_dataset.setToolTip("导出链路状态数据集")
+        self.act_redis_enable.setToolTip("连接或断开 Redis")
 
         toolbar.addAction(self.act_generate_walker)
         toolbar.addSeparator()
@@ -226,7 +260,33 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.act_export_dataset)
         toolbar.addSeparator()
         toolbar.addAction(self.act_redis_enable)
+
+        self.act_toggle_details = QAction(
+            QIcon(str(icon_dir / "panel.svg")),
+            "链路详情",
+            self,
+        )
+        self.act_toggle_details.setCheckable(True)
+        self.act_toggle_details.setChecked(True)
+        self.act_toggle_details.setToolTip("显示或隐藏链路详情")
+        self.act_toggle_details.toggled.connect(self._toggle_link_details)
+        toolbar.addAction(self.act_toggle_details)
+
         self.addToolBar(Qt.TopToolBarArea, toolbar)
+
+        play_button = toolbar.widgetForAction(self.act_play)
+        if play_button is not None:
+            play_button.setObjectName("primaryToolButton")
+            play_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
+        redis_button = toolbar.widgetForAction(self.act_redis_enable)
+        if redis_button is not None:
+            redis_button.setObjectName("connectionToolButton")
+
+    def _toggle_link_details(self, visible: bool) -> None:
+        self.table_panel.setVisible(visible)
+        if visible:
+            self.workspace_splitter.setSizes([600, 240])
 
     def _set_redis_action_checked(self, checked: bool) -> None:
         if not hasattr(self, "act_redis_enable"):
@@ -348,6 +408,7 @@ class MainWindow(QMainWindow):
         self.table_panel.set_records(
             self.registry.all_links_data,
             redis_in_flight=self.redis_query_in_flight,
+            redis_enabled=self.redis_enabled,
             redis_last_error=self.redis_last_error,
             active_count=self.registry.active_count,
         )
@@ -444,59 +505,92 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "导出数据集", "请选择输出目录。")
             return
 
-        progress = QProgressDialog(
+        self._start_link_dataset_export(config)
+
+    def _start_link_dataset_export(self, config: Dict[str, Any]) -> None:
+        if self.export_worker_thread is not None:
+            return
+
+        export_config = {
+            "orbit_num": self.current_walker_config["orbit_num"],
+            "sat_per_orbit": self.current_walker_config["sat_per_orbit"],
+            "time_slices": config["time_slices"],
+            "duration_sec": config["duration_sec"],
+            "output_dir": config["output_dir"],
+            "phase_factor": self.current_walker_config["phase_factor"],
+            "altitude_km": self.current_walker_config["altitude_km"],
+            "inclination_deg": self.current_walker_config["inclination_deg"],
+            "random_failure_enabled": config["random_failure_enabled"],
+            "failure_probability": config["failure_probability"],
+            "random_seed": config["random_seed"],
+            "strategy": self._clone_strategy(),
+            "start_time": self.current_time,
+            "epoch_time": self.current_walker_config["epoch_time"],
+        }
+
+        self.export_progress = QProgressDialog(
             "正在生成链路状态数据集...",
             "取消",
             0,
             config["time_slices"],
             self,
         )
-        progress.setWindowTitle("导出链路状态数据集")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
+        self.export_progress.setWindowTitle("导出链路状态数据集")
+        self.export_progress.setWindowModality(Qt.WindowModal)
+        self.export_progress.setMinimumDuration(0)
 
-        def report_progress(done: int, total: int) -> bool:
-            progress.setMaximum(total)
-            progress.setValue(done)
-            QApplication.processEvents()
-            return not progress.wasCanceled()
+        self.export_worker_thread = QThread(self)
+        self.export_worker = LinkDatasetExportWorker(export_config)
+        self.export_worker.moveToThread(self.export_worker_thread)
+        self.export_worker_thread.started.connect(self.export_worker.run)
+        self.export_worker.progress.connect(self._update_export_progress)
+        self.export_worker.finished.connect(self._handle_export_finished)
+        self.export_worker.finished.connect(self.export_worker_thread.quit)
+        self.export_worker_thread.finished.connect(self.export_worker.deleteLater)
+        self.export_worker_thread.finished.connect(self._cleanup_export_worker)
+        self.export_progress.canceled.connect(self._cancel_link_dataset_export)
+        self.export_worker_thread.start()
 
-        try:
-            result = LinkDatasetExporter().export(
-                orbit_num=self.current_walker_config["orbit_num"],
-                sat_per_orbit=self.current_walker_config["sat_per_orbit"],
-                time_slices=config["time_slices"],
-                duration_sec=config["duration_sec"],
-                output_dir=config["output_dir"],
-                phase_factor=self.current_walker_config["phase_factor"],
-                altitude_km=self.current_walker_config["altitude_km"],
-                inclination_deg=self.current_walker_config["inclination_deg"],
-                random_failure_enabled=config["random_failure_enabled"],
-                failure_probability=config["failure_probability"],
-                random_seed=config["random_seed"],
-                strategy=self._clone_strategy(),
-                start_time=self.current_time,
-                epoch_time=self.current_walker_config["epoch_time"],
-                progress_callback=report_progress,
+    @Slot()
+    def _cancel_link_dataset_export(self) -> None:
+        if self.export_worker is not None:
+            self.export_worker.cancel()
+
+    @Slot(int, int)
+    def _update_export_progress(self, done: int, total: int) -> None:
+        if self.export_progress is not None:
+            self.export_progress.setMaximum(total)
+            self.export_progress.setValue(done)
+
+    @Slot(bool, object, str)
+    def _handle_export_finished(self, ok: bool, result: Any, message: str) -> None:
+        if self.export_progress is not None:
+            was_cancelled = self.export_progress.wasCanceled()
+            self.export_progress.close()
+        else:
+            was_cancelled = not ok and not message
+
+        if ok:
+            QMessageBox.information(
+                self,
+                "导出数据集",
+                (
+                    f"已生成 {result.file_count} 个卫星文件，"
+                    f"每个文件包含 {result.time_slices} 个时间片。\n\n{result.output_dir}"
+                ),
             )
-        except LinkDatasetExportCancelled:
-            QMessageBox.information(self, "导出数据集", "导出已取消。")
-            return
-        except Exception as exc:
-            QMessageBox.warning(self, "导出数据集", f"导出失败：\n{exc}")
-            return
-        finally:
-            progress.close()
+        elif not was_cancelled:
+            QMessageBox.warning(self, "导出数据集", f"导出失败：\n{message}")
 
-        QMessageBox.information(
-            self,
-            "导出数据集",
-            (
-                f"已生成 {result.file_count} 个卫星文件，"
-                f"每个文件包含 {result.time_slices} 个时间片。\n\n{result.output_dir}"
-            ),
-        )
+    @Slot()
+    def _cleanup_export_worker(self) -> None:
+        if self.export_worker_thread is not None:
+            self.export_worker_thread.deleteLater()
+        self.export_worker_thread = None
+        self.export_worker = None
+        if self.export_progress is not None:
+            self.export_progress.deleteLater()
+        self.export_progress = None
 
     def _has_walker_constellation(self) -> bool:
         return bool(self.calculator.satellites)
@@ -559,9 +653,7 @@ class MainWindow(QMainWindow):
         self.remote_sudo_password = sudo_password
 
         self.act_play.setText("停止")
-        self.act_play.setIcon(
-            self.style().standardIcon(QStyle.SP_MediaStop)
-        )
+        self.act_play.setIcon(self.icon_stop)
         self.act_deploy.setEnabled(False)
         self.act_step.setEnabled(False)
 
@@ -585,7 +677,7 @@ class MainWindow(QMainWindow):
             self.remote_measure_worker = None
 
         self.act_play.setText("开始")
-        self.act_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.act_play.setIcon(self.icon_play)
         self.act_step.setEnabled(True)
         if not self.deploy_completed:
             self.act_deploy.setEnabled(True)
@@ -773,7 +865,9 @@ class MainWindow(QMainWindow):
         isl, active_links = self.strategy.compute_links(self.calculator.satellites)
         self.registry.apply_active_links(active_links)
         self._schedule_redis_update_if_needed()
-        self._refresh_table()
+        self._animation_frame += 1
+        if self._animation_frame % 3 == 0:
+            self._refresh_table()
 
         self.visualizer.update_scene(
             sats,
@@ -806,12 +900,21 @@ class MainWindow(QMainWindow):
             if self.remote_measure_worker is not None:
                 self.remote_measure_worker.cancel()
             self.remote_measure_thread.quit()
-            self.remote_measure_thread.wait(5000)
-        self.stop_redis_worker()
+            self.remote_measure_thread.wait(2500)
+        self.stop_redis_worker(wait=True)
+        for thread in tuple(self._retiring_redis_threads):
+            if thread.isRunning():
+                thread.quit()
+                thread.wait(500)
         if self.deploy_worker_thread is not None:
             if self.deploy_worker is not None:
                 self.deploy_worker.cancel()
             self.deploy_worker_thread.quit()
-            self.deploy_worker_thread.wait(5000)
+            self.deploy_worker_thread.wait(2500)
+        if self.export_worker_thread is not None:
+            if self.export_worker is not None:
+                self.export_worker.cancel()
+            self.export_worker_thread.quit()
+            self.export_worker_thread.wait(2500)
         self.visualizer.close()
         super().closeEvent(event)

@@ -1,7 +1,5 @@
 import sys
 import os
-from PySide6.QtWidgets import QApplication
-from gui.main_window import MainWindow
 
 
 def configure_linux_display_backend() -> None:
@@ -15,9 +13,21 @@ def configure_linux_display_backend() -> None:
     os.environ.setdefault("GDK_BACKEND", "x11")
 
 
-if __name__ == "__main__":
+def main() -> int:
     configure_linux_display_backend()
+
+    # Qt reads its platform configuration during import/application startup.
+    # Keep these imports after the environment has been configured.
+    from PySide6.QtWidgets import QApplication
+    from gui.main_window import MainWindow
+
     app = QApplication(sys.argv)
+    if sys.platform != "darwin":
+        app.setStyle("Fusion")
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
