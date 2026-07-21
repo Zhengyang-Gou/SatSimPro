@@ -199,7 +199,11 @@ class MainWindow(QMainWindow):
 
         m_sim = mb.addMenu("仿真")
 
-        self.act_play = QAction("开始", self)
+        self.act_local_play = QAction("本地运行", self)
+        self.act_local_play.triggered.connect(self.toggle_local_sim)
+        self.act_local_play.setEnabled(False)
+
+        self.act_play = QAction("远程运行", self)
         self.act_play.triggered.connect(self.toggle_sim)
         self.act_play.setEnabled(False)
 
@@ -213,18 +217,18 @@ class MainWindow(QMainWindow):
         self.act_export_dataset.triggered.connect(self.open_link_dataset_export)
 
         m_sim.addAction(self.act_deploy)
+        m_sim.addAction(self.act_local_play)
         m_sim.addAction(self.act_play)
         m_sim.addAction(self.act_step)
         m_sim.addSeparator()
         m_sim.addAction(self.act_export_dataset)
-
-        m_redis = mb.addMenu("Redis")
 
         self.act_redis_enable = QAction("启用 Redis 查询", self)
         self.act_redis_enable.setCheckable(True)
         self.act_redis_enable.setChecked(self.redis_enabled)
         self.act_redis_enable.toggled.connect(self.toggle_redis_query)
 
+        m_redis = mb.addMenu("Redis")
         m_redis.addAction(self.act_redis_enable)
 
     def _init_toolbar(self) -> None:
@@ -240,6 +244,7 @@ class MainWindow(QMainWindow):
         self.icon_stop = QIcon(str(icon_dir / "stop.svg"))
         self.act_generate_walker.setIcon(QIcon(str(icon_dir / "constellation.svg")))
         self.act_deploy.setIcon(QIcon(str(icon_dir / "deploy.svg")))
+        self.act_local_play.setIcon(self.icon_play)
         self.act_play.setIcon(self.icon_play)
         self.act_step.setIcon(QIcon(str(icon_dir / "step.svg")))
         self.act_export_dataset.setIcon(QIcon(str(icon_dir / "export.svg")))
@@ -247,6 +252,7 @@ class MainWindow(QMainWindow):
 
         self.act_generate_walker.setToolTip("生成 Walker 星座")
         self.act_deploy.setToolTip("部署远程仿真环境")
+        self.act_local_play.setToolTip("开始或停止本地星座推演")
         self.act_play.setToolTip("开始或停止远程仿真")
         self.act_step.setToolTip("设置仿真步长")
         self.act_export_dataset.setToolTip("导出链路状态数据集")
@@ -255,6 +261,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.act_generate_walker)
         toolbar.addSeparator()
         toolbar.addAction(self.act_deploy)
+        toolbar.addAction(self.act_local_play)
         toolbar.addAction(self.act_play)
         toolbar.addAction(self.act_step)
         toolbar.addAction(self.act_export_dataset)
@@ -274,10 +281,11 @@ class MainWindow(QMainWindow):
 
         self.addToolBar(Qt.TopToolBarArea, toolbar)
 
-        play_button = toolbar.widgetForAction(self.act_play)
-        if play_button is not None:
-            play_button.setObjectName("primaryToolButton")
-            play_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        for play_action in (self.act_local_play, self.act_play):
+            play_button = toolbar.widgetForAction(play_action)
+            if play_button is not None:
+                play_button.setObjectName("primaryToolButton")
+                play_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
         redis_button = toolbar.widgetForAction(self.act_redis_enable)
         if redis_button is not None:
@@ -452,6 +460,7 @@ class MainWindow(QMainWindow):
                 "epoch_time": self.current_time,
             }
             self.reset_simulation_state()
+            self.act_local_play.setEnabled(True)
             self.act_play.setEnabled(True)
             self.loop(advance=False)
 
@@ -625,6 +634,33 @@ class MainWindow(QMainWindow):
         else:
             self.start_remote_play()
 
+    def toggle_local_sim(self) -> None:
+        if self.is_playing:
+            self.stop_local_play()
+            return
+
+        if not self.calculator.satellites:
+            QMessageBox.warning(self, "Play", "请先生成 Walker 星座。")
+            return
+
+        self.is_playing = True
+        self.remote_play_epoch_time = None
+        self.act_local_play.setText("停止本地")
+        self.act_local_play.setIcon(self.icon_stop)
+        self.act_play.setEnabled(False)
+        self.act_step.setEnabled(False)
+        self.timer.start(100)
+        self.statusBar().showMessage(f"本地星座推演中，步长 {self.step_size:g} 秒")
+
+    def stop_local_play(self) -> None:
+        self.is_playing = False
+        self.timer.stop()
+        self.act_local_play.setText("本地运行")
+        self.act_local_play.setIcon(self.icon_play)
+        self.act_play.setEnabled(bool(self.calculator.satellites))
+        self.act_step.setEnabled(True)
+        self.statusBar().showMessage("本地星座推演已停止")
+
     def start_remote_play(self) -> None:
         if not self.calculator.satellites:
             QMessageBox.warning(self, "Play", "请先生成 Walker 星座。")
@@ -654,6 +690,7 @@ class MainWindow(QMainWindow):
 
         self.act_play.setText("停止")
         self.act_play.setIcon(self.icon_stop)
+        self.act_local_play.setEnabled(False)
         self.act_deploy.setEnabled(False)
         self.act_step.setEnabled(False)
 
@@ -676,8 +713,9 @@ class MainWindow(QMainWindow):
             self.remote_measure_thread = None
             self.remote_measure_worker = None
 
-        self.act_play.setText("开始")
+        self.act_play.setText("远程运行")
         self.act_play.setIcon(self.icon_play)
+        self.act_local_play.setEnabled(bool(self.calculator.satellites))
         self.act_step.setEnabled(True)
         if not self.deploy_completed:
             self.act_deploy.setEnabled(True)

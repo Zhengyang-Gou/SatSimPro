@@ -44,6 +44,13 @@ conda env update -f environment.yml --prune
 python main.py
 ```
 
+启动后生成 Walker 星座，可在前端选择两种运行方式：
+
+- `本地运行`：仅在本机推进星座，不执行 SSH、远程测量或 Redis 查询。
+- `远程运行`：保留 Deploy、远程时间片测量和 Redis 查询流程。
+
+本地推演可通过“仿真 -> 步长设置”配置每次推进的仿真秒数。
+
 Linux Wayland 环境下，程序会自动尝试切换到 X11 后端以提升 Qt/VTK 兼容性。
 
 ## 基本使用
