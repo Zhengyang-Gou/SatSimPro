@@ -9,6 +9,7 @@ from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QDialog,
+    QHBoxLayout,
     QInputDialog,
     QLineEdit,
     QMainWindow,
@@ -42,6 +43,7 @@ from .remote_play_worker import RemoteMeasureSliceWorker
 from .table_panel import LinkTablePanel
 from .theme import DARK_THEME
 from .topology_registry import TopologyRegistry
+from .trend_panel import NetworkTrendPanel
 from .visualizer import Visualizer
 
 
@@ -171,8 +173,18 @@ class MainWindow(QMainWindow):
         self.workspace_splitter.setChildrenCollapsible(False)
         self.workspace_splitter.setHandleWidth(1)
 
+        scene_row = QWidget()
+        scene_row.setObjectName("sceneRow")
+        scene_layout = QHBoxLayout(scene_row)
+        scene_layout.setContentsMargins(0, 0, 0, 0)
+        scene_layout.setSpacing(0)
+
         self.visualizer = Visualizer()
-        self.workspace_splitter.addWidget(self.visualizer)
+        scene_layout.addWidget(self.visualizer, 1)
+
+        self.trend_panel = NetworkTrendPanel()
+        scene_layout.addWidget(self.trend_panel)
+        self.workspace_splitter.addWidget(scene_row)
 
         self.table_panel = LinkTablePanel(page_size=10)
         self.table_panel.selection_changed.connect(self._on_selected_links_changed)
@@ -918,8 +930,37 @@ class MainWindow(QMainWindow):
             current_time=self.current_time,
             redis_status=self._redis_status_text(),
         )
+        self._update_trend_panel(len(active_links))
         self.statusBar().showMessage(
             f"卫星：{len(self.calculator.satellites)} | 活动链路：{len(active_links)}"
+        )
+
+    def _update_trend_panel(self, active_link_count: int) -> None:
+        active_records = [
+            self.registry.link_registry[key]
+            for key in self.registry.active_link_keys
+            if key in self.registry.link_registry
+        ]
+
+        def numeric_values(field: str):
+            values = []
+            for record in active_records:
+                try:
+                    values.append(float(record.get(field)))
+                except (TypeError, ValueError):
+                    continue
+            return values
+
+        latencies = numeric_values("latency")
+        losses = numeric_values("redis_loss_pct")
+        total_links = len(self.registry.link_registry)
+        directed_active_count = self.registry.active_count
+
+        self.trend_panel.update_metrics(
+            average_latency=sum(latencies) / len(latencies) if latencies else None,
+            availability=(directed_active_count / total_links) if total_links else None,
+            average_loss=sum(losses) / len(losses) if losses else None,
+            active_links=active_link_count,
         )
 
     def _redis_status_text(self) -> str:

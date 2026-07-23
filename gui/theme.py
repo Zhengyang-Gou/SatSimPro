@@ -13,6 +13,13 @@ QWidget {
 QWidget#workspace {
     background-color: #171719;
 }
+QWidget#sceneRow {
+    background-color: #0f1218;
+}
+QWidget#networkTrendPanel {
+    background-color: #171b22;
+    border-left: 1px solid #343a45;
+}
 QWidget#linkTablePanel {
     background-color: #242426;
     border-top: 1px solid #38383a;
