@@ -1,0 +1,5 @@
+owner=platform-maintainers
+gzy0=/home/s223/yzy
+gzy1=/home/test/yzy
+components=docker,ovs,veth,receiver,measurement
+policy=compatibility-source-during-migration

@@ -18,3 +18,7 @@ ENV/
 # --- 操作系统相关 ---
 .DS_Store
 Thumbs.db
+
+# --- Local remote-deployment scratch data ---
+# Historical scripts, generated datasets, archives, logs, and diagnostics.
+.remote-staging/

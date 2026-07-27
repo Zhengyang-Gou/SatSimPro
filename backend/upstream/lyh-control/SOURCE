@@ -1,0 +1,5 @@
+owner=lyh
+gzy0=/home/s223/lyh/sat_deploy
+gzy1=/home/test/sat_deploy
+components=route/onos,scripts/sync_server.py,scripts/run_all_lyh.sh
+policy=read-only

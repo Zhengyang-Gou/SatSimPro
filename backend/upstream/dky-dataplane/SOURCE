@@ -1,0 +1,5 @@
+owner=dky
+gzy0=/home/s223/dky
+gzy1=/home/test/dky
+components=af_xdp,kernel,scripts,listener
+policy=read-only
