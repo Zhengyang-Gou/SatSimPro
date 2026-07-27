@@ -1,4 +1,4 @@
-"""Background worker for remote one-click deployment."""
+"""Background worker for distributed one-click deployment."""
 
 from __future__ import annotations
 
@@ -6,90 +6,125 @@ import os
 import signal
 import subprocess
 import sys
-from typing import Optional
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from .config import (
-    DEFAULT_REMOTE_DEPLOY_SCRIPT,
+    RemoteBackend,
+    backend_configs_from_env,
     build_ssh_command,
-    sudo_password_from_env_or_file,
+    sudo_password_for_backend,
 )
 
 
 class RemoteDeployWorker(QObject):
-    """Run the remote deployment script without blocking the GUI thread."""
+    """Run every backend deployment concurrently without blocking the GUI."""
 
     finished = Signal(bool, str)
 
     def __init__(
         self,
         *,
-        ssh_host_alias: Optional[str] = None,
-        remote_script: str = DEFAULT_REMOTE_DEPLOY_SCRIPT,
-        sudo_password: Optional[str] = None,
+        backends: Optional[Sequence[RemoteBackend]] = None,
+        sudo_passwords: Optional[Dict[str, str]] = None,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
-        self.ssh_host_alias = ssh_host_alias
-        self.remote_script = remote_script
-        self.sudo_password = sudo_password
-        self._process: Optional[subprocess.Popen[str]] = None
-        self._cancelled = False
+        self.backends = tuple(backends or backend_configs_from_env())
+        self.sudo_passwords = dict(sudo_passwords or {})
+        self._processes: Dict[str, subprocess.Popen[str]] = {}
+        self._process_lock = threading.Lock()
+        self._cancelled = threading.Event()
 
     @Slot()
     def run(self) -> None:
-        password = self._read_sudo_password()
-        command = build_ssh_command(
-            f"sudo -S -p '' bash {self.remote_script}",
-            self.ssh_host_alias,
+        results = []
+        try:
+            with ThreadPoolExecutor(
+                max_workers=max(1, len(self.backends)),
+                thread_name_prefix="deploy",
+            ) as executor:
+                futures = {
+                    executor.submit(self._run_backend, backend): backend.name
+                    for backend in self.backends
+                }
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        results.append((name, False, str(exc)))
+        except Exception as exc:
+            self.finished.emit(False, f"并行部署启动失败：{exc}")
+            return
+
+        results.sort(key=lambda item: item[0])
+        message = "\n".join(
+            f"[{name}] {'完成' if ok else '失败'}{f'：{output}' if output else ''}"
+            for name, ok, output in results
         )
+        ok = bool(results) and all(result[1] for result in results) and not self._cancelled.is_set()
+        self.finished.emit(ok, message or "部署已取消")
+
+    def _run_backend(self, backend: RemoteBackend) -> Tuple[str, bool, str]:
+        if self._cancelled.is_set():
+            return backend.name, False, "已取消"
+
+        password = self.sudo_passwords.get(backend.name)
+        if password is None:
+            password = sudo_password_for_backend(backend) or ""
+        command = build_ssh_command(
+            (
+                "sudo -S -p '' env "
+                f"SATNET_BACKEND={backend.name} "
+                f"SATNET_ORBIT_START={backend.orbit_start} "
+                f"SATNET_ORBIT_END={backend.orbit_end} "
+                f"bash {backend.deploy_script}"
+            ),
+            backend=backend,
+        )
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **self._popen_process_group_kwargs(),
+        )
+        with self._process_lock:
+            self._processes[backend.name] = process
 
         try:
-            self._process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **self._popen_process_group_kwargs(),
-            )
-            output, _ = self._process.communicate(
-                input=f"{password}\n" if password else "\n",
-            )
-        except Exception as exc:
-            if self._cancelled:
-                self.finished.emit(False, "Deploy 已取消")
-            else:
-                self.finished.emit(False, f"Deploy 启动失败：{exc}")
-            return
+            output, _ = process.communicate(input=f"{password}\n" if password else "\n")
+            returncode = process.returncode
         finally:
-            process = self._process
-            self._process = None
+            with self._process_lock:
+                self._processes.pop(backend.name, None)
 
-        returncode = process.returncode if process is not None else 1
         output = (output or "").strip()
-        if self._cancelled:
-            self.finished.emit(False, "Deploy 已取消")
-        elif returncode == 0:
-            self.finished.emit(True, output or "部署完成")
-        else:
-            self.finished.emit(False, output or f"Deploy 失败，退出码 {returncode}")
+        if self._cancelled.is_set():
+            return backend.name, False, "已取消"
+        if returncode == 0:
+            return backend.name, True, self._tail(output)
+        return backend.name, False, self._tail(output) or f"退出码 {returncode}"
 
     @Slot()
     def cancel(self) -> None:
-        self._cancelled = True
-        process = self._process
-        if process is None or process.poll() is not None:
-            return
-        self._terminate_process(process)
+        self._cancelled.set()
+        with self._process_lock:
+            processes = list(self._processes.values())
+        for process in processes:
+            if process.poll() is None:
+                self._terminate_process(process)
 
-    def _read_sudo_password(self) -> str:
-        if self.sudo_password is not None:
-            return self.sudo_password
-        return sudo_password_from_env_or_file() or ""
+    def _tail(self, output: str, limit: int = 6) -> str:
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        return " | ".join(lines[-limit:])
 
     def _popen_process_group_kwargs(self) -> dict:
         if sys.platform.startswith("win"):
@@ -97,6 +132,8 @@ class RemoteDeployWorker(QObject):
         return {"start_new_session": True}
 
     def _terminate_process(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
         if sys.platform.startswith("win"):
             process.terminate()
         else:

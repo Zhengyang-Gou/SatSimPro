@@ -1,13 +1,29 @@
 """Generate OVS port mappings for fixed satellite links."""
 
+from core.placement import (
+    DEFAULT_HOST_ORBIT_RANGES,
+    host_for_satellite,
+    link_scope,
+    normalize_host_ranges,
+)
+
 PORTS_BY_NEIGHBOR_SLOT = (4, 3, 1, 2)
 
 
-def generate_link_info(satellites, fixed_neighbors, satellite_ids) -> str:
+def generate_link_info(
+    satellites,
+    fixed_neighbors,
+    satellite_ids,
+    *,
+    include_placement=False,
+    host_ranges=DEFAULT_HOST_ORBIT_RANGES,
+    bridge_by_host=None,
+) -> str:
     """Return the contents of a link_info file for the supplied constellation."""
     lines = []
     emitted = set()
     port_map = _build_port_map(fixed_neighbors)
+    normalized_ranges = normalize_host_ranges(host_ranges)
     for satellite_idx, neighbors in fixed_neighbors.items():
         satellite = satellites[satellite_idx]
         sat_id = satellite_ids[satellite_idx]
@@ -24,6 +40,9 @@ def generate_link_info(satellites, fixed_neighbors, satellite_ids) -> str:
                 neighbor,
                 sat_id,
                 neighbor_id,
+                include_placement,
+                normalized_ranges,
+                bridge_by_host,
             )
             _append_link(
                 lines,
@@ -35,6 +54,9 @@ def generate_link_info(satellites, fixed_neighbors, satellite_ids) -> str:
                 satellite,
                 neighbor_id,
                 sat_id,
+                include_placement,
+                normalized_ranges,
+                bridge_by_host,
             )
 
     return "\n".join(lines)
@@ -61,6 +83,9 @@ def _append_link(
     neighbor,
     sat_id,
     neighbor_id,
+    include_placement,
+    host_ranges,
+    bridge_by_host,
 ):
     key = (sat_id, neighbor_id)
     if key in emitted:
@@ -74,11 +99,22 @@ def _append_link(
         satellite,
         neighbor,
     )
-    lines.append(
+    source_host = host_for_satellite(satellite, host_ranges) or "unassigned"
+    target_host = host_for_satellite(neighbor, host_ranges) or "unassigned"
+    source_bridge = (bridge_by_host or {}).get(source_host, "brA")
+    target_bridge = (bridge_by_host or {}).get(target_host, "brA")
+    line = (
         f"{sat_id}-{neighbor_id} "
         f"S{sat_id}_{self_port}-S{neighbor_id}_{neighbor_port} "
-        f"brA{sat_id}_{self_port}-brA{neighbor_id}_{neighbor_port}"
+        f"{source_bridge}{sat_id}_{self_port}-"
+        f"{target_bridge}{neighbor_id}_{neighbor_port}"
     )
+    if include_placement:
+        line += (
+            f" {source_host}-{target_host} "
+            f"{link_scope(satellite, neighbor, host_ranges)}"
+        )
+    lines.append(line)
 
 
 def _ports_for_link(port_map, satellite_idx, neighbor_idx, satellite, neighbor):

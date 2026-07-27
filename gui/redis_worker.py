@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
-from core.redis_latency import RedisLatencyProvider
+from core.redis_latency import MultiRedisLatencyProvider, RedisLatencyProvider
 from .link_state import LinkRecord
 
 
@@ -17,11 +17,14 @@ class RedisQueryWorker(QObject):
     def __init__(self, redis_config: Dict[str, Any]):
         super().__init__()
         self.redis_config = redis_config
-        self.provider: Optional[RedisLatencyProvider] = None
+        self.provider: Optional[Any] = None
 
-    def _provider(self) -> RedisLatencyProvider:
+    def _provider(self):
         if self.provider is None:
-            self.provider = RedisLatencyProvider(**self.redis_config)
+            if self.redis_config.get("backends"):
+                self.provider = MultiRedisLatencyProvider(**self.redis_config)
+            else:
+                self.provider = RedisLatencyProvider(**self.redis_config)
         return self.provider
 
     @Slot(int, int, object, object)

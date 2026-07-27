@@ -109,8 +109,8 @@ class NetworkTrendPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("networkTrendPanel")
-        self.setMinimumWidth(260)
-        self.setMaximumWidth(360)
+        self.setMinimumWidth(520)
+        self.setMaximumWidth(720)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)

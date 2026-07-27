@@ -1,13 +1,21 @@
 import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
 from core.calculator import OrbitCalculator
 from core.strategies import GridDeltaStrategy
-from gui.config import build_ssh_command, env_float, env_int
+from gui.config import (
+    backend_configs_from_env,
+    build_ssh_command,
+    env_float,
+    env_int,
+    redis_password_for_backend,
+)
 
 
 class OrbitCalculatorTests(unittest.TestCase):
@@ -57,6 +65,38 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("-p", command)
         self.assertTrue(command[-2].endswith("@121.48.163.223"))
         self.assertEqual(command[-1], "true")
+
+    def test_default_backends_cover_the_60_orbits_without_overlap(self):
+        backends = backend_configs_from_env()
+        self.assertEqual(
+            [(item.name, item.orbit_start, item.orbit_end) for item in backends],
+            [("gzy0", 1, 30), ("gzy1", 31, 60)],
+        )
+        self.assertEqual(build_ssh_command("true", backend=backends[0])[-2], "gzy0")
+        self.assertEqual(build_ssh_command("true", backend=backends[1])[-2], "gzy1")
+        self.assertEqual(
+            backends[0].deploy_script,
+            "/home/s223/satnet-backend/scripts/deploy.sh",
+        )
+        self.assertEqual(
+            backends[1].measure_script,
+            "/home/test/satnet-backend/scripts/measure_slice.sh",
+        )
+
+    def test_backend_redis_password_files_are_independent(self):
+        backends = backend_configs_from_env()
+        with tempfile.TemporaryDirectory() as directory:
+            gzy0_path = Path(directory) / "gzy0_password"
+            gzy1_path = Path(directory) / "gzy1_password"
+            gzy0_path.write_text("redis-zero\n", encoding="utf-8")
+            gzy1_path.write_text("redis-one\n", encoding="utf-8")
+            environment = {
+                "SATNET_GZY0_REDIS_PASSWORD_FILE": str(gzy0_path),
+                "SATNET_GZY1_REDIS_PASSWORD_FILE": str(gzy1_path),
+            }
+            with patch.dict(os.environ, environment, clear=False):
+                self.assertEqual(redis_password_for_backend(backends[0]), "redis-zero")
+                self.assertEqual(redis_password_for_backend(backends[1]), "redis-one")
 
 
 if __name__ == "__main__":

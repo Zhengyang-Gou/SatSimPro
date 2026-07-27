@@ -93,21 +93,23 @@ Linux Wayland 环境下，程序会自动尝试切换到 X11 后端以提升 Qt/
 仿真 -> 步长设置
 ```
 
-`Deploy` 会通过已配置的 SSH 主机执行远端脚本
-`/home/s223/yzy/scripts/deploy.sh`，用于清理旧环境、创建容器和 OVS、
-启动 rawsock 与收包器。部署过程在后台线程执行，成功后按钮会变为
+`Deploy` 会并行连接 `gzy0` 和 `gzy1`，分别部署轨道 01–30 与
+31–60，用于创建两端容器和 OVS、启动数据面与收包器。两端都成功后按钮才会变为
 `Deployed` 并灰掉。
 
 `开始` 会进入远程实验播放模式：GUI 每 100 ms 平滑推进 Walker 画面，
-同时每 10 秒启动一个远程时间片测量：
+同时每 10 秒在两台后端并行启动同一个远程时间片测量：
 
 ```text
-sudo bash /home/s223/yzy/scripts/measure_slice.sh <ts> 5 10
+gzy0: sudo bash /home/s223/satnet-backend/scripts/measure_slice.sh <ts> 5 10 <start_ms>
+gzy1: sudo bash /home/test/satnet-backend/scripts/measure_slice.sh <ts> 5 10 <start_ms>
 ```
 
 时间片从 `ts=0` 开始。远端脚本顺序执行：写入当前时间片、调用
 `apply_slice.py` 下发流表和 tc、发送 delay 探测包、发送 loss 探测包。
-如果某个时间片测量超过 10 秒，GUI 会停止播放并报错，不会启动下一片。
+两端使用相同的探测开始时间。测量命令内部截止时间默认为 20 秒；只有两端测量和
+Redis 查询都完成后，该时间片才算闭环。任一阶段超过 10 秒，GUI 会停止播放，
+不会启动下一片。
 
 `步长设置` 仅用于非远程播放时的本地推进步长。
 
@@ -124,7 +126,7 @@ sudo bash /home/s223/yzy/scripts/measure_slice.sh <ts> 5 10
 导出参数：
 
 - `时间片数量`：导出的时间片数量
-- `仿真总时长`：总仿真时长，单位秒
+- `时间片周期`：每个时间片对应的仿真时间，默认 10 秒
 - `Enable Random Link Failure`：是否启用随机链路失效
 - `Down Probability / Slice`：每个时间片的链路失效概率
 - `Random Seed`：随机种子
@@ -134,11 +136,19 @@ sudo bash /home/s223/yzy/scripts/measure_slice.sh <ts> 5 10
 
 ```text
 LinkDataset_YYYYMMDD_HHMMSS/
-  link_info_15_35.txt
+  link_info_60_20.txt
   manifest.json
   satellite_10101.txt
-  satellite_10102.txt
   ...
+  hosts/
+    gzy0/
+      manifest.json
+      link_info_60_20.txt
+      processed_data_60_20/
+    gzy1/
+      manifest.json
+      link_info_60_20.txt
+      processed_data_60_20/
 ```
 
 `manifest.json` 记录本次仿真的运行编号、单个时间片时长和时间片数量：
@@ -181,8 +191,9 @@ Satellite_10102 Satellite_10201 Satellite_10199 Satellite_10103
 Redis -> 启用 Redis 查询
 ```
 
-Redis 查询默认关闭。勾选后，程序会自动通过 SSH 连接固定服务器
-`121.48.163.223`，并访问该服务器本机的 Redis `127.0.0.1:6379`。
+Redis 查询默认关闭。勾选后，程序会分别通过 SSH 连接 `gzy0` 和 `gzy1`，
+并行访问两端本机的 Redis `127.0.0.1:6379`。有向链路按照源卫星所属轨道
+路由到对应Redis，查询完成后再合并为一个时间片结果。
 
 也可以在启动前用环境变量默认启用：
 
@@ -190,8 +201,11 @@ Redis 查询默认关闭。勾选后，程序会自动通过 SSH 连接固定服
 SATNET_REDIS_ENABLED=1
 ```
 
-SSH 主机、用户名、私钥、Redis 地址和 Redis key 前缀均已固定在项目配置中。
-密码不会写入项目；默认使用 SSH 私钥免密连接。Redis 密码写入仅当前用户可读的
+SSH 主机、用户名、私钥、Redis地址和轨道范围可通过 `SATNET_GZY0_*` 与
+`SATNET_GZY1_*` 环境变量覆盖。密码不会写入项目；后台SSH要求使用私钥免密连接。
+两台后端的 Redis 密码分别写入仅当前用户可读的
+`~/.config/satellite-simulation/gzy0_redis_password` 和
+`~/.config/satellite-simulation/gzy1_redis_password`。若两端密码相同，也可使用共享的
 `~/.config/satellite-simulation/redis_password`。
 
 Redis key 默认格式：

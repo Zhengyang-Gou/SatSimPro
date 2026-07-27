@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .config import DEFAULT_REMOTE_SLICE_DURATION_SEC
+
 
 def _configure_form_layout(layout: QFormLayout) -> None:
     layout.setContentsMargins(16, 16, 16, 16)
@@ -173,14 +175,14 @@ class LinkDatasetExportDialog(QDialog):
         self.spin_time_slices.setRange(1, 1_000_000)
         self.spin_time_slices.setValue(6000)
 
-        self.spin_duration = QDoubleSpinBox()
-        self.spin_duration.setRange(0.1, 31_536_000.0)
-        self.spin_duration.setDecimals(1)
-        self.spin_duration.setValue(6000.0)
-        self.spin_duration.setSuffix(" s")
+        self.spin_step_duration = QDoubleSpinBox()
+        self.spin_step_duration.setRange(0.1, 3600.0)
+        self.spin_step_duration.setDecimals(1)
+        self.spin_step_duration.setValue(DEFAULT_REMOTE_SLICE_DURATION_SEC)
+        self.spin_step_duration.setSuffix(" s")
 
         simulation_layout.addRow("时间片数量：", self.spin_time_slices)
-        simulation_layout.addRow("仿真总时长：", self.spin_duration)
+        simulation_layout.addRow("时间片周期：", self.spin_step_duration)
         layout.addWidget(simulation_group)
 
         failure_group = QGroupBox("随机链路失效")
@@ -229,7 +231,7 @@ class LinkDatasetExportDialog(QDialog):
     def config(self) -> Dict[str, Any]:
         return {
             "time_slices": self.spin_time_slices.value(),
-            "duration_sec": self.spin_duration.value(),
+            "duration_sec": self.spin_time_slices.value() * self.spin_step_duration.value(),
             "random_failure_enabled": self.chk_random_failure.isChecked(),
             "failure_probability": self.spin_failure_probability.value(),
             "random_seed": self.spin_random_seed.value(),

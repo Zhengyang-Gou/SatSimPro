@@ -26,9 +26,11 @@ from core.strategies import GridDeltaStrategy
 from .config import (
     DEFAULT_REMOTE_SLICE_DURATION_SEC,
     DEFAULT_REMOTE_TIME_SLICES,
+    DEFAULT_REMOTE_NODES_PER_ORBIT,
+    backend_configs_from_env,
     env_int,
     redis_config_from_env,
-    sudo_password_from_env_or_file,
+    sudo_password_for_backend,
 )
 from .deploy_worker import RemoteDeployWorker
 from .export_worker import LinkDatasetExportWorker
@@ -61,7 +63,10 @@ class MainWindow(QMainWindow):
 
         self.calculator = OrbitCalculator()
         self.strategy = GridDeltaStrategy()
-        self.registry = TopologyRegistry()
+        self.remote_backends = tuple(backend_configs_from_env())
+        self.registry = TopologyRegistry(
+            [backend.as_dict() for backend in self.remote_backends]
+        )
 
         self.redis_config = redis_config_from_env()
         self.redis_enabled = bool(self.redis_config.get("enabled", False))
@@ -88,7 +93,7 @@ class MainWindow(QMainWindow):
         self.remote_play_epoch_time: Optional[datetime] = None
         self.remote_play_started_at = 0.0
         self.remote_slice_active_links: Dict[int, Any] = {}
-        self.remote_sudo_password: Optional[str] = None
+        self.remote_sudo_passwords: Dict[str, str] = {}
 
         if self.redis_enabled:
             self.start_redis_worker(self.redis_config)
@@ -335,9 +340,13 @@ class MainWindow(QMainWindow):
     def deploy_remote(self) -> None:
         if self.deploy_worker_thread is not None:
             return
+        layout_error = self._remote_backend_layout_error()
+        if layout_error:
+            QMessageBox.warning(self, "Deploy", layout_error)
+            return
 
-        sudo_password = self._get_remote_sudo_password()
-        if sudo_password is None:
+        sudo_passwords = self._get_remote_sudo_passwords()
+        if sudo_passwords is None:
             return
 
         self.deploy_completed = False
@@ -346,7 +355,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("正在远程部署，请稍候...")
 
         self.deploy_worker_thread = QThread(self)
-        self.deploy_worker = RemoteDeployWorker(sudo_password=sudo_password)
+        self.deploy_worker = RemoteDeployWorker(
+            backends=self.remote_backends,
+            sudo_passwords=sudo_passwords,
+        )
         self.deploy_worker.moveToThread(self.deploy_worker_thread)
         self.deploy_worker_thread.started.connect(self.deploy_worker.run)
         self.deploy_worker.finished.connect(self._handle_deploy_finished)
@@ -385,24 +397,48 @@ class MainWindow(QMainWindow):
             return ""
         return "\n".join(lines[-8:])
 
-    def _get_remote_sudo_password(self) -> Optional[str]:
-        configured_password = sudo_password_from_env_or_file()
-        if configured_password:
-            return configured_password
-        if self.remote_sudo_password:
-            return self.remote_sudo_password
+    def _get_remote_sudo_passwords(self) -> Optional[Dict[str, str]]:
+        passwords = dict(self.remote_sudo_passwords)
+        for backend in self.remote_backends:
+            configured_password = sudo_password_for_backend(backend)
+            if configured_password:
+                passwords[backend.name] = configured_password
+                continue
+            if passwords.get(backend.name):
+                continue
 
-        password, ok = QInputDialog.getText(
-            self,
-            "远程 sudo 密码",
-            "请输入远程主机 s223 用户的 sudo 密码：",
-            QLineEdit.Password,
+            password, ok = QInputDialog.getText(
+                self,
+                f"{backend.name} sudo 密码",
+                (
+                    f"请输入 {backend.name} "
+                    f"({backend.ssh_username}@{backend.ssh_host}) 的 sudo 密码："
+                ),
+                QLineEdit.Password,
+            )
+            if not ok:
+                return None
+            passwords[backend.name] = password
+
+        self.remote_sudo_passwords = passwords
+        return dict(passwords)
+
+    def _remote_backend_layout_error(self) -> str:
+        if not self.current_walker_config:
+            return "请先生成用于远程运行的 Walker 星座。"
+        expected_orbits = sum(
+            backend.orbit_end - backend.orbit_start + 1
+            for backend in self.remote_backends
         )
-        if not ok:
-            return None
-
-        self.remote_sudo_password = password
-        return password
+        actual_orbits = int(self.current_walker_config["orbit_num"])
+        actual_nodes = int(self.current_walker_config["sat_per_orbit"])
+        if actual_orbits != expected_orbits or actual_nodes != DEFAULT_REMOTE_NODES_PER_ORBIT:
+            return (
+                "当前远程后端要求 "
+                f"{expected_orbits}×{DEFAULT_REMOTE_NODES_PER_ORBIT} 星座，"
+                f"当前为 {actual_orbits}×{actual_nodes}。"
+            )
+        return ""
 
     def _on_selected_links_changed(self, selected: Set[LinkKey]) -> None:
         self.selected_link_pairs = selected
@@ -547,6 +583,10 @@ class MainWindow(QMainWindow):
             "strategy": self._clone_strategy(),
             "start_time": self.current_time,
             "epoch_time": self.current_walker_config["epoch_time"],
+            "host_ranges": [
+                backend.as_dict()
+                for backend in self.remote_backends
+            ],
         }
 
         self.export_progress = QProgressDialog(
@@ -677,11 +717,15 @@ class MainWindow(QMainWindow):
         if not self.calculator.satellites:
             QMessageBox.warning(self, "Play", "请先生成 Walker 星座。")
             return
+        layout_error = self._remote_backend_layout_error()
+        if layout_error:
+            QMessageBox.warning(self, "Play", layout_error)
+            return
         if self.remote_measure_thread is not None:
             return
 
-        sudo_password = self._get_remote_sudo_password()
-        if sudo_password is None:
+        sudo_passwords = self._get_remote_sudo_passwords()
+        if sudo_passwords is None:
             return
 
         if not self.redis_enabled:
@@ -698,7 +742,7 @@ class MainWindow(QMainWindow):
         self.remote_play_started_at = monotonic()
         self.redis_last_error = ""
         self.redis_query_in_flight = False
-        self.remote_sudo_password = sudo_password
+        self.remote_sudo_passwords = dict(sudo_passwords)
 
         self.act_play.setText("停止")
         self.act_play.setIcon(self.icon_stop)
@@ -740,9 +784,13 @@ class MainWindow(QMainWindow):
     def _on_remote_slice_tick(self) -> None:
         if not self.is_playing:
             return
-        if self.remote_measure_in_flight:
+        if self.remote_measure_in_flight or self.redis_query_in_flight:
+            pending = "远程测量" if self.remote_measure_in_flight else "Redis结果读取"
             self.stop_remote_play(
-                f"时间片 {self.remote_current_slice} 未在 {self.remote_slice_duration_sec:g}s 内完成，已停止。"
+                (
+                    f"时间片 {self.remote_current_slice} 的{pending}"
+                    f"未在 {self.remote_slice_duration_sec:g}s 内完成，已停止。"
+                )
             )
             return
 
@@ -785,7 +833,8 @@ class MainWindow(QMainWindow):
         self.remote_measure_thread = QThread(self)
         self.remote_measure_worker = RemoteMeasureSliceWorker(
             time_slice=time_slice,
-            sudo_password=self.remote_sudo_password,
+            backends=self.remote_backends,
+            sudo_passwords=self.remote_sudo_passwords,
         )
         self.remote_measure_worker.moveToThread(self.remote_measure_thread)
         self.remote_measure_thread.started.connect(self.remote_measure_worker.run)
@@ -871,6 +920,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         if query_id != self.redis_query_seq:
             return
+        if self.is_playing and time_slice >= 0 and time_slice != self.remote_current_slice:
+            return
 
         self.redis_query_in_flight = False
         self.redis_last_error = ""
@@ -895,6 +946,10 @@ class MainWindow(QMainWindow):
         self.redis_last_error = message or "Redis 查询失败"
         self.registry.mark_redis_down()
         self._refresh_table()
+        if self.is_playing and time_slice >= 0:
+            self.stop_remote_play(
+                f"时间片 {time_slice} Redis 查询失败：{self.redis_last_error}"
+            )
 
     def loop(self, advance: bool = True) -> None:
         if not self.calculator.satellites:

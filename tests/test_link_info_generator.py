@@ -75,6 +75,28 @@ class GenerateLinkInfoTests(unittest.TestCase):
     def test_empty_neighbors_returns_empty_content(self):
         self.assertEqual(generate_link_info([], {}, {}), "")
 
+    def test_placement_marks_cross_host_links(self):
+        satellites = [
+            SimpleNamespace(plane_idx=29, node_idx=0),
+            SimpleNamespace(plane_idx=30, node_idx=0),
+        ]
+        result = generate_link_info(
+            satellites,
+            {0: [1]},
+            {0: "13001", 1: "13101"},
+            include_placement=True,
+            bridge_by_host={"gzy0": "brB", "gzy1": "brB"},
+        )
+        self.assertEqual(
+            result.splitlines(),
+            [
+                "13001-13101 S13001_3-S13101_4 brB13001_3-brB13101_4 "
+                "gzy0-gzy1 cross_host",
+                "13101-13001 S13101_4-S13001_3 brB13101_4-brB13001_3 "
+                "gzy1-gzy0 cross_host",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

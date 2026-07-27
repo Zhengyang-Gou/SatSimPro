@@ -1,4 +1,4 @@
-"""Background worker for one remote measurement time slice."""
+"""Background worker for one distributed remote measurement time slice."""
 
 from __future__ import annotations
 
@@ -6,23 +6,27 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from .config import (
     DEFAULT_REMOTE_COMMAND_TIMEOUT_SEC,
-    DEFAULT_REMOTE_MEASURE_SCRIPT,
     DEFAULT_REMOTE_PROBE_COUNT,
+    DEFAULT_REMOTE_PROBE_LEAD_SEC,
     DEFAULT_REMOTE_PROBE_PPS,
+    RemoteBackend,
+    backend_configs_from_env,
     build_ssh_command,
-    sudo_password_from_env_or_file,
+    sudo_password_for_backend,
 )
 
 
 class RemoteMeasureSliceWorker(QObject):
-    """Execute one remote measure_slice.sh transaction."""
+    """Execute one measure_slice transaction concurrently on every backend."""
 
     finished = Signal(int, bool, str, float)
 
@@ -30,96 +34,131 @@ class RemoteMeasureSliceWorker(QObject):
         self,
         *,
         time_slice: int,
-        ssh_host_alias: Optional[str] = None,
-        remote_script: str = DEFAULT_REMOTE_MEASURE_SCRIPT,
+        backends: Optional[Sequence[RemoteBackend]] = None,
         probe_count: int = DEFAULT_REMOTE_PROBE_COUNT,
         probe_pps: float = DEFAULT_REMOTE_PROBE_PPS,
         timeout_sec: float = DEFAULT_REMOTE_COMMAND_TIMEOUT_SEC,
-        sudo_password: Optional[str] = None,
+        probe_lead_sec: float = DEFAULT_REMOTE_PROBE_LEAD_SEC,
+        sudo_passwords: Optional[Dict[str, str]] = None,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
         self.time_slice = int(time_slice)
-        self.ssh_host_alias = ssh_host_alias
-        self.remote_script = remote_script
+        self.backends = tuple(backends or backend_configs_from_env())
         self.probe_count = int(probe_count)
         self.probe_pps = float(probe_pps)
         self.timeout_sec = float(timeout_sec)
-        self.sudo_password = sudo_password
-        self._process: Optional[subprocess.Popen[str]] = None
-        self._cancelled = False
+        self.probe_lead_sec = float(probe_lead_sec)
+        self.sudo_passwords = dict(sudo_passwords or {})
+        self._processes: Dict[str, subprocess.Popen[str]] = {}
+        self._process_lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self.probe_start_epoch_ms = 0
 
     @Slot()
     def run(self) -> None:
-        password = self._read_sudo_password()
-        command = build_ssh_command(
-            (
-                f"sudo -S -p '' timeout {self.timeout_sec:g}s bash {self.remote_script} "
-                f"{self.time_slice} {self.probe_count} {self.probe_pps:g}"
-            ),
-            self.ssh_host_alias,
-        )
-
         started_at = time.monotonic()
+        self.probe_start_epoch_ms = int(
+            (time.time() + self.probe_lead_sec) * 1000
+        )
+        results: List[Tuple[str, bool, str]] = []
         try:
-            self._process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                **self._popen_process_group_kwargs(),
-            )
-            output, _ = self._process.communicate(
+            with ThreadPoolExecutor(
+                max_workers=max(1, len(self.backends)),
+                thread_name_prefix="measure",
+            ) as executor:
+                futures = {
+                    executor.submit(self._run_backend, backend): backend.name
+                    for backend in self.backends
+                }
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        results.append((name, False, str(exc)))
+        except Exception as exc:
+            elapsed = time.monotonic() - started_at
+            self.finished.emit(self.time_slice, False, f"并行测量启动失败：{exc}", elapsed)
+            return
+
+        elapsed = time.monotonic() - started_at
+        results.sort(key=lambda item: item[0])
+        message = "\n".join(
+            f"[{name}] {'完成' if ok else '失败'}{f'：{output}' if output else ''}"
+            for name, ok, output in results
+        )
+        ok = bool(results) and all(result[1] for result in results) and not self._cancelled.is_set()
+        if self._cancelled.is_set():
+            message = message or f"时间片 {self.time_slice} 已取消"
+        self.finished.emit(self.time_slice, ok, message, elapsed)
+
+    def _run_backend(self, backend: RemoteBackend) -> Tuple[str, bool, str]:
+        if self._cancelled.is_set():
+            return backend.name, False, "已取消"
+
+        password = self.sudo_passwords.get(backend.name)
+        if password is None:
+            password = sudo_password_for_backend(backend) or ""
+
+        remote_command = (
+            f"sudo -S -p '' env "
+            f"SATNET_BACKEND={backend.name} "
+            f"SATNET_ORBIT_START={backend.orbit_start} "
+            f"SATNET_ORBIT_END={backend.orbit_end} "
+            f"SATNET_PROBE_START_EPOCH_MS={self.probe_start_epoch_ms} "
+            f"timeout {self.timeout_sec:g}s "
+            f"bash {backend.measure_script} "
+            f"{self.time_slice} {self.probe_count} {self.probe_pps:g} "
+            f"{self.probe_start_epoch_ms}"
+        )
+        command = build_ssh_command(remote_command, backend=backend)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **self._popen_process_group_kwargs(),
+        )
+        with self._process_lock:
+            self._processes[backend.name] = process
+
+        try:
+            output, _ = process.communicate(
                 input=f"{password}\n" if password else "\n",
                 timeout=self.timeout_sec + 1.0,
             )
-            returncode = self._process.returncode
+            returncode = process.returncode
         except subprocess.TimeoutExpired as exc:
-            self.cancel()
-            elapsed = time.monotonic() - started_at
-            output = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else ""
-            message = output or f"时间片 {self.time_slice} 远端测量超过 {self.timeout_sec:g}s"
-            self.finished.emit(self.time_slice, False, message, elapsed)
-            return
-        except Exception as exc:
-            elapsed = time.monotonic() - started_at
-            if self._cancelled:
-                self.finished.emit(self.time_slice, False, f"时间片 {self.time_slice} 已取消", elapsed)
-            else:
-                self.finished.emit(self.time_slice, False, f"时间片 {self.time_slice} 启动失败：{exc}", elapsed)
-            return
+            self._terminate_process(process)
+            output = exc.stdout if isinstance(exc.stdout, str) else ""
+            return backend.name, False, (output or f"超过 {self.timeout_sec:g}s").strip()
         finally:
-            self._process = None
+            with self._process_lock:
+                self._processes.pop(backend.name, None)
 
-        elapsed = time.monotonic() - started_at
         output = (output or "").strip()
-        if self._cancelled:
-            self.finished.emit(self.time_slice, False, f"时间片 {self.time_slice} 已取消", elapsed)
-        elif returncode == 0:
-            self.finished.emit(self.time_slice, True, output or f"时间片 {self.time_slice} 完成", elapsed)
-        else:
-            self.finished.emit(
-                self.time_slice,
-                False,
-                output or f"时间片 {self.time_slice} 失败，退出码 {returncode}",
-                elapsed,
-            )
+        if self._cancelled.is_set():
+            return backend.name, False, "已取消"
+        if returncode == 0:
+            return backend.name, True, self._tail(output)
+        return backend.name, False, self._tail(output) or f"退出码 {returncode}"
 
     @Slot()
     def cancel(self) -> None:
-        self._cancelled = True
-        process = self._process
-        if process is None or process.poll() is not None:
-            return
-        self._terminate_process(process)
+        self._cancelled.set()
+        with self._process_lock:
+            processes = list(self._processes.values())
+        for process in processes:
+            if process.poll() is None:
+                self._terminate_process(process)
 
-    def _read_sudo_password(self) -> str:
-        if self.sudo_password is not None:
-            return self.sudo_password
-        return sudo_password_from_env_or_file() or ""
+    def _tail(self, output: str, limit: int = 4) -> str:
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        return " | ".join(lines[-limit:])
 
     def _popen_process_group_kwargs(self) -> dict:
         if sys.platform.startswith("win"):
@@ -127,6 +166,8 @@ class RemoteMeasureSliceWorker(QObject):
         return {"start_new_session": True}
 
     def _terminate_process(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
         if sys.platform.startswith("win"):
             process.terminate()
         else:

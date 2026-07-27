@@ -4,7 +4,15 @@ from typing import Any, Dict, List, Set
 
 from core.strategies import GridDeltaStrategy
 
-from .link_state import LinkKey, LinkRecord, directed_link_key, is_down, link_key, remote_sat_id
+from .link_state import (
+    LinkKey,
+    LinkRecord,
+    directed_link_key,
+    is_down,
+    link_key,
+    remote_host_name,
+    remote_sat_id,
+)
 from .theme import DOWN
 
 
@@ -18,12 +26,13 @@ class TopologyRegistry:
     table rows every frame, so pagination and selection remain stable.
     """
 
-    def __init__(self):
+    def __init__(self, host_ranges=None):
         self.link_registry: Dict[LinkKey, LinkRecord] = {}
         self.all_links_data: List[LinkRecord] = []
         self.active_link_keys: Set[LinkKey] = set()
         self.active_count = 0
         self.is_locked = False
+        self.host_ranges = host_ranges
 
     def reset(self, strategy: Any) -> None:
         self.link_registry.clear()
@@ -104,6 +113,8 @@ class TopologyRegistry:
     ) -> LinkRecord:
         src_id = remote_sat_id(satellites[src])
         tgt_id = remote_sat_id(satellites[tgt])
+        src_host = remote_host_name(satellites[src], self.host_ranges)
+        tgt_host = remote_host_name(satellites[tgt], self.host_ranges)
         return {
             "id": f"{src_id}-{tgt_id}",
             "src": src,
@@ -112,6 +123,9 @@ class TopologyRegistry:
             "tgt_id": tgt_id,
             "src_name": str(src_id),
             "tgt_name": str(tgt_id),
+            "src_host": src_host,
+            "tgt_host": tgt_host,
+            "scope": "local" if src_host == tgt_host else "cross_host",
             "neighbor_order": neighbor_order,
             "latency": DOWN,
             "redis_delay_ratio_pct": DOWN,

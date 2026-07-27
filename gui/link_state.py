@@ -4,6 +4,8 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 
+from core.placement import host_for_satellite
+
 from .theme import DOWN
 
 LinkKey = Tuple[int, int]
@@ -23,6 +25,13 @@ def directed_link_key(src: int, tgt: int) -> LinkKey:
 def remote_sat_id(sat: Any) -> int:
     """Return the satellite id used by the remote container/Redis scripts."""
     return 10000 + (sat.plane_idx + 1) * 100 + (sat.node_idx + 1)
+
+
+def remote_host_name(sat: Any, host_ranges=None) -> str:
+    """Return the backend owning a satellite, or ``unassigned``."""
+    if host_ranges is None:
+        return host_for_satellite(sat) or "unassigned"
+    return host_for_satellite(sat, host_ranges) or "unassigned"
 
 
 def is_down(value: Any) -> bool:
