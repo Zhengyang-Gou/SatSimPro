@@ -104,6 +104,8 @@ class RemoteBackend:
     ssh_username: str
     ssh_private_key: str
     deploy_script: str
+    health_script: str
+    cleanup_script: str
     measure_script: str
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
@@ -141,6 +143,14 @@ def _backend_from_env(
         deploy_script=env_str(
             f"{prefix}REMOTE_DEPLOY_SCRIPT",
             f"{home}/satnet-backend/scripts/deploy.sh",
+        ),
+        health_script=env_str(
+            f"{prefix}REMOTE_HEALTH_SCRIPT",
+            f"{home}/satnet-backend/scripts/health.sh",
+        ),
+        cleanup_script=env_str(
+            f"{prefix}REMOTE_CLEANUP_SCRIPT",
+            f"{home}/satnet-backend/scripts/cleanup.sh",
         ),
         measure_script=env_str(
             f"{prefix}REMOTE_MEASURE_SCRIPT",

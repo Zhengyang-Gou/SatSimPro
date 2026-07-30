@@ -14,11 +14,15 @@ QWidget#workspace {
     background-color: #171719;
 }
 QWidget#sceneRow {
-    background-color: #0f1218;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1a1f29, stop:1 #0f1218);
 }
 QWidget#networkTrendPanel {
-    background-color: #171b22;
-    border-left: 1px solid #343a45;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1a1f29, stop:1 #0f1218);
+    border: none;
+}
+QWidget#endToEndDelayPanel {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1a1f29, stop:1 #0f1218);
+    border: none;
 }
 QWidget#linkTablePanel {
     background-color: #242426;
@@ -100,6 +104,7 @@ QGroupBox::title {
 }
 QLabel { color: #e5e5e7; background: transparent; }
 QLabel#panelTitle { color: #f5f5f7; font-size: 15px; font-weight: 600; }
+QLabel#sectionTitle { color: #f5f5f7; font-size: 18px; font-weight: 600; }
 QLabel#hintLabel { color: #98989d; }
 QLabel#metricChip,
 QLabel#activeChip,

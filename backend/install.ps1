@@ -30,7 +30,7 @@ foreach ($Target in $Targets) {
         throw "Failed to create $RemoteRoot on $Target"
     }
 
-    foreach ($Item in @("config", "scripts", "upstream", "runtime", "README.md")) {
+    foreach ($Item in @("config", "patches", "scripts", "upstream", "runtime", "README.md")) {
         scp -r (Join-Path $BackendSource $Item) "${Target}:$RemoteRoot/"
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to upload $Item to $Target"

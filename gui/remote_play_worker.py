@@ -23,6 +23,7 @@ from .config import (
     build_ssh_command,
     sudo_password_for_backend,
 )
+from .output_text import decode_external_output
 
 
 class RemoteMeasureSliceWorker(QObject):
@@ -50,7 +51,7 @@ class RemoteMeasureSliceWorker(QObject):
         self.timeout_sec = float(timeout_sec)
         self.probe_lead_sec = float(probe_lead_sec)
         self.sudo_passwords = dict(sudo_passwords or {})
-        self._processes: Dict[str, subprocess.Popen[str]] = {}
+        self._processes: Dict[str, subprocess.Popen[bytes]] = {}
         self._process_lock = threading.Lock()
         self._cancelled = threading.Event()
         self.probe_start_epoch_ms = 0
@@ -118,29 +119,27 @@ class RemoteMeasureSliceWorker(QObject):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             **self._popen_process_group_kwargs(),
         )
         with self._process_lock:
             self._processes[backend.name] = process
 
         try:
-            output, _ = process.communicate(
-                input=f"{password}\n" if password else "\n",
+            password_input = f"{password}\n".encode("utf-8") if password else b"\n"
+            output_bytes, _ = process.communicate(
+                input=password_input,
                 timeout=self.timeout_sec + 1.0,
             )
             returncode = process.returncode
         except subprocess.TimeoutExpired as exc:
             self._terminate_process(process)
-            output = exc.stdout if isinstance(exc.stdout, str) else ""
+            output = decode_external_output(exc.stdout)
             return backend.name, False, (output or f"超过 {self.timeout_sec:g}s").strip()
         finally:
             with self._process_lock:
                 self._processes.pop(backend.name, None)
 
-        output = (output or "").strip()
+        output = decode_external_output(output_bytes)
         if self._cancelled.is_set():
             return backend.name, False, "已取消"
         if returncode == 0:
@@ -165,7 +164,7 @@ class RemoteMeasureSliceWorker(QObject):
             return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         return {"start_new_session": True}
 
-    def _terminate_process(self, process: subprocess.Popen[str]) -> None:
+    def _terminate_process(self, process: subprocess.Popen[bytes]) -> None:
         if process.poll() is not None:
             return
         if sys.platform.startswith("win"):

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from time import monotonic
 from typing import Any, Dict, Optional, Set
+from uuid import uuid4
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
@@ -32,7 +33,12 @@ from .config import (
     redis_config_from_env,
     sudo_password_for_backend,
 )
+from .backend_lifecycle_worker import (
+    RemoteBackendLifecycleWorker,
+    cleanup_backends_sync,
+)
 from .deploy_worker import RemoteDeployWorker
+from .endpoint_delay_panel import EndToEndDelayPanel
 from .export_worker import LinkDatasetExportWorker
 from .dialogs import (
     LinkDatasetExportDialog,
@@ -42,10 +48,11 @@ from .dialogs import (
 from .link_state import LinkKey, link_pairs_to_lines, satellite_positions_array
 from .redis_worker import RedisQueryWorker
 from .remote_play_worker import RemoteMeasureSliceWorker
+from .output_text import sanitize_external_text
 from .table_panel import LinkTablePanel
 from .theme import DARK_THEME
 from .topology_registry import TopologyRegistry
-from .trend_panel import NetworkTrendPanel
+from .trend_panel import NetworkTrendPanel, ranked_metric_data
 from .visualizer import Visualizer
 
 
@@ -80,10 +87,16 @@ class MainWindow(QMainWindow):
         self._retiring_redis_threads: Set[QThread] = set()
         self.deploy_worker_thread: Optional[QThread] = None
         self.deploy_worker: Optional[RemoteDeployWorker] = None
+        self.lifecycle_worker_thread: Optional[QThread] = None
+        self.lifecycle_worker: Optional[RemoteBackendLifecycleWorker] = None
+        self.lifecycle_context = ""
         self.export_worker_thread: Optional[QThread] = None
         self.export_worker: Optional[LinkDatasetExportWorker] = None
         self.export_progress: Optional[QProgressDialog] = None
         self.deploy_completed = False
+        self.remote_session_id = uuid4().hex
+        self.remote_deployment_owned = False
+        self.remote_backend_details: Dict[str, Any] = {}
         self.remote_measure_thread: Optional[QThread] = None
         self.remote_measure_worker: Optional[RemoteMeasureSliceWorker] = None
         self.remote_measure_in_flight = False
@@ -116,6 +129,7 @@ class MainWindow(QMainWindow):
         self.remote_slice_timer = QTimer(self)
         self.remote_slice_timer.setInterval(int(self.remote_slice_duration_sec * 1000))
         self.remote_slice_timer.timeout.connect(self._on_remote_slice_tick)
+        QTimer.singleShot(0, self.check_remote_deployment)
 
     def start_redis_worker(self, redis_config: Dict[str, Any]) -> None:
         self.stop_redis_worker()
@@ -184,11 +198,13 @@ class MainWindow(QMainWindow):
         scene_layout.setContentsMargins(0, 0, 0, 0)
         scene_layout.setSpacing(0)
 
+        self.endpoint_delay_panel = EndToEndDelayPanel()
+        scene_layout.addWidget(self.endpoint_delay_panel, 1)
+
         self.visualizer = Visualizer()
         scene_layout.addWidget(self.visualizer, 1)
-
         self.trend_panel = NetworkTrendPanel()
-        scene_layout.addWidget(self.trend_panel)
+        scene_layout.addWidget(self.trend_panel, 1)
         self.workspace_splitter.addWidget(scene_row)
 
         self.table_panel = LinkTablePanel(page_size=10)
@@ -227,6 +243,10 @@ class MainWindow(QMainWindow):
         self.act_deploy = QAction("Deploy", self)
         self.act_deploy.triggered.connect(self.deploy_remote)
 
+        self.act_cleanup = QAction("清理远端", self)
+        self.act_cleanup.triggered.connect(self.cleanup_remote)
+        self.act_cleanup.setEnabled(False)
+
         self.act_step = QAction("步长设置", self)
         self.act_step.triggered.connect(self.open_step_settings)
 
@@ -234,6 +254,7 @@ class MainWindow(QMainWindow):
         self.act_export_dataset.triggered.connect(self.open_link_dataset_export)
 
         m_sim.addAction(self.act_deploy)
+        m_sim.addAction(self.act_cleanup)
         m_sim.addAction(self.act_local_play)
         m_sim.addAction(self.act_play)
         m_sim.addAction(self.act_step)
@@ -261,6 +282,7 @@ class MainWindow(QMainWindow):
         self.icon_stop = QIcon(str(icon_dir / "stop.svg"))
         self.act_generate_walker.setIcon(QIcon(str(icon_dir / "constellation.svg")))
         self.act_deploy.setIcon(QIcon(str(icon_dir / "deploy.svg")))
+        self.act_cleanup.setIcon(QIcon(str(icon_dir / "cleanup.svg")))
         self.act_local_play.setIcon(self.icon_play)
         self.act_play.setIcon(self.icon_play)
         self.act_step.setIcon(QIcon(str(icon_dir / "step.svg")))
@@ -269,6 +291,7 @@ class MainWindow(QMainWindow):
 
         self.act_generate_walker.setToolTip("生成 Walker 星座")
         self.act_deploy.setToolTip("部署远程仿真环境")
+        self.act_cleanup.setToolTip("手动清理远程仿真环境")
         self.act_local_play.setToolTip("开始或停止本地星座推演")
         self.act_play.setToolTip("开始或停止远程仿真")
         self.act_step.setToolTip("设置仿真步长")
@@ -278,6 +301,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.act_generate_walker)
         toolbar.addSeparator()
         toolbar.addAction(self.act_deploy)
+        toolbar.addAction(self.act_cleanup)
         toolbar.addAction(self.act_local_play)
         toolbar.addAction(self.act_play)
         toolbar.addAction(self.act_step)
@@ -338,7 +362,7 @@ class MainWindow(QMainWindow):
         self._refresh_table()
 
     def deploy_remote(self) -> None:
-        if self.deploy_worker_thread is not None:
+        if self.deploy_worker_thread is not None or self.lifecycle_worker_thread is not None:
             return
         layout_error = self._remote_backend_layout_error()
         if layout_error:
@@ -348,9 +372,12 @@ class MainWindow(QMainWindow):
         sudo_passwords = self._get_remote_sudo_passwords()
         if sudo_passwords is None:
             return
+        self.remote_sudo_passwords = dict(sudo_passwords)
 
         self.deploy_completed = False
+        self.remote_deployment_owned = False
         self.act_deploy.setEnabled(False)
+        self.act_cleanup.setEnabled(False)
         self.act_deploy.setText("Deploying...")
         self.statusBar().showMessage("正在远程部署，请稍候...")
 
@@ -358,6 +385,7 @@ class MainWindow(QMainWindow):
         self.deploy_worker = RemoteDeployWorker(
             backends=self.remote_backends,
             sudo_passwords=sudo_passwords,
+            session_id=self.remote_session_id,
         )
         self.deploy_worker.moveToThread(self.deploy_worker_thread)
         self.deploy_worker_thread.started.connect(self.deploy_worker.run)
@@ -371,16 +399,26 @@ class MainWindow(QMainWindow):
     def _handle_deploy_finished(self, ok: bool, message: str) -> None:
         summary = self._deploy_message_summary(message)
         if ok:
-            self.deploy_completed = True
-            self.act_deploy.setText("Deployed")
-            self.statusBar().showMessage(summary or "远程部署完成")
-            QMessageBox.information(self, "Deploy", summary or "远程部署完成。")
+            self.remote_deployment_owned = True
+            self.statusBar().showMessage("部署命令完成，正在校验远端运行状态...")
+            self._start_lifecycle_operation(
+                "health",
+                context="deploy_verify",
+                sudo_passwords=self.remote_sudo_passwords,
+            )
         else:
             self.deploy_completed = False
+            self.remote_deployment_owned = False
             self.act_deploy.setText("Deploy")
             self.act_deploy.setEnabled(True)
+            self.act_cleanup.setEnabled(True)
             self.statusBar().showMessage("远程部署失败")
-            QMessageBox.warning(self, "Deploy 失败", summary or "远程部署失败。")
+            self._show_result_dialog(
+                QMessageBox.Warning,
+                "部署失败",
+                "远程仿真环境部署失败，请检查详细信息。",
+                summary,
+            )
 
     @Slot()
     def _cleanup_deploy_worker(self) -> None:
@@ -388,14 +426,206 @@ class MainWindow(QMainWindow):
             self.deploy_worker_thread.deleteLater()
         self.deploy_worker_thread = None
         self.deploy_worker = None
-        if not self.deploy_completed and hasattr(self, "act_deploy"):
+        if (
+            not self.deploy_completed
+            and self.lifecycle_worker_thread is None
+            and hasattr(self, "act_deploy")
+        ):
             self.act_deploy.setEnabled(True)
 
+    def check_remote_deployment(self) -> None:
+        configured_passwords = {}
+        for backend in self.remote_backends:
+            password = sudo_password_for_backend(backend)
+            if password:
+                configured_passwords[backend.name] = password
+        self.remote_sudo_passwords.update(configured_passwords)
+        self._start_lifecycle_operation(
+            "health",
+            context="startup",
+            sudo_passwords=configured_passwords,
+        )
+
+    def cleanup_remote(self) -> None:
+        if self.lifecycle_worker_thread is not None or self.deploy_worker_thread is not None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "清理远端环境",
+            "将停止远端接收进程，并删除卫星容器、OVS 网桥和运行状态。确定继续吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        sudo_passwords = self._get_remote_sudo_passwords()
+        if sudo_passwords is None:
+            return
+        self.remote_sudo_passwords = dict(sudo_passwords)
+        self._start_lifecycle_operation(
+            "cleanup",
+            context="manual_cleanup",
+            sudo_passwords=sudo_passwords,
+            force=True,
+        )
+
+    def _start_lifecycle_operation(
+        self,
+        operation: str,
+        *,
+        context: str,
+        sudo_passwords: Optional[Dict[str, str]] = None,
+        force: bool = False,
+    ) -> None:
+        if self.lifecycle_worker_thread is not None:
+            return
+        self.lifecycle_context = context
+        self.act_deploy.setEnabled(False)
+        self.act_cleanup.setEnabled(False)
+        if operation == "health":
+            self.act_deploy.setText("Checking...")
+            self.statusBar().showMessage("正在检测远端部署状态...")
+        else:
+            self.statusBar().showMessage("正在清理远端仿真环境...")
+
+        self.lifecycle_worker_thread = QThread(self)
+        self.lifecycle_worker = RemoteBackendLifecycleWorker(
+            operation,
+            backends=self.remote_backends,
+            sudo_passwords=sudo_passwords,
+            session_id=self.remote_session_id,
+            force=force,
+        )
+        self.lifecycle_worker.moveToThread(self.lifecycle_worker_thread)
+        self.lifecycle_worker_thread.started.connect(self.lifecycle_worker.run)
+        self.lifecycle_worker.finished.connect(self._handle_lifecycle_finished)
+        self.lifecycle_worker.finished.connect(self.lifecycle_worker_thread.quit)
+        self.lifecycle_worker_thread.finished.connect(self.lifecycle_worker.deleteLater)
+        self.lifecycle_worker_thread.finished.connect(self._cleanup_lifecycle_worker)
+        self.lifecycle_worker_thread.start()
+
+    @Slot(str, bool, object, str)
+    def _handle_lifecycle_finished(
+        self,
+        operation: str,
+        ok: bool,
+        details: object,
+        message: str,
+    ) -> None:
+        context = self.lifecycle_context
+        self.remote_backend_details = dict(details) if isinstance(details, dict) else {}
+        summary = self._deploy_message_summary(message)
+
+        if operation == "cleanup":
+            if ok:
+                self.deploy_completed = False
+                self.remote_deployment_owned = False
+                self.remote_backend_details = {}
+                self.act_deploy.setText("Deploy")
+                self.act_deploy.setEnabled(True)
+                self.act_cleanup.setEnabled(False)
+                self.statusBar().showMessage("远端仿真环境已清理")
+                if context == "manual_cleanup":
+                    self._show_result_dialog(
+                        QMessageBox.Information,
+                        "清理完成",
+                        "两台后端的仿真资源已清理。",
+                        summary,
+                    )
+            else:
+                self.act_deploy.setText("Deploy")
+                self.act_deploy.setEnabled(True)
+                self.act_cleanup.setEnabled(True)
+                self.statusBar().showMessage("远端清理未完全成功")
+                if context == "manual_cleanup":
+                    self._show_result_dialog(
+                        QMessageBox.Warning,
+                        "清理失败",
+                        "部分远端资源可能未清理，请检查详细信息。",
+                        summary,
+                    )
+            return
+
+        self.deploy_completed = ok
+        if ok:
+            sessions = {
+                str(item.get("session_id", ""))
+                for item in self.remote_backend_details.values()
+                if isinstance(item, dict)
+            }
+            if sessions == {self.remote_session_id}:
+                self.remote_deployment_owned = True
+            self.act_deploy.setText("Deployed")
+            self.act_deploy.setEnabled(False)
+            self.act_cleanup.setEnabled(True)
+            self.statusBar().showMessage("远端环境已部署，可直接远程运行")
+            if context == "deploy_verify":
+                self._show_result_dialog(
+                    QMessageBox.Information,
+                    "部署完成",
+                    "远程仿真环境已部署并通过健康检查。",
+                    summary,
+                )
+            elif context == "run":
+                QTimer.singleShot(0, self._begin_remote_play)
+        else:
+            self.act_deploy.setText("Deploy")
+            self.act_deploy.setEnabled(True)
+            has_remote_resources = any(
+                isinstance(item, dict) and item.get("health") == "deployed"
+                for item in self.remote_backend_details.values()
+            )
+            self.act_cleanup.setEnabled(has_remote_resources or context == "deploy_verify")
+            self.statusBar().showMessage("远端环境未部署、状态不完整或不可达")
+            if context == "deploy_verify":
+                self._show_result_dialog(
+                    QMessageBox.Warning,
+                    "部署校验失败",
+                    "部署命令已结束，但远端健康检查未通过。",
+                    summary,
+                )
+            elif context == "run":
+                self._show_result_dialog(
+                    QMessageBox.Warning,
+                    "无法远程运行",
+                    "远端环境未通过健康检查，请先部署或修复后端。",
+                    summary,
+                )
+
+    @Slot()
+    def _cleanup_lifecycle_worker(self) -> None:
+        if self.lifecycle_worker_thread is not None:
+            self.lifecycle_worker_thread.deleteLater()
+        self.lifecycle_worker_thread = None
+        self.lifecycle_worker = None
+        self.lifecycle_context = ""
+
     def _deploy_message_summary(self, message: str) -> str:
-        lines = [line.strip() for line in str(message).splitlines() if line.strip()]
+        cleaned_message = sanitize_external_text(message)
+        lines = [line.strip() for line in cleaned_message.splitlines() if line.strip()]
         if not lines:
             return ""
         return "\n".join(lines[-8:])
+
+    def _show_result_dialog(
+        self,
+        icon: QMessageBox.Icon,
+        title: str,
+        text: str,
+        details: str = "",
+    ) -> None:
+        dialog = QMessageBox(self)
+        dialog.setIcon(icon)
+        dialog.setWindowTitle(title)
+        dialog.setText(text)
+        clean_details = sanitize_external_text(details)
+        if clean_details:
+            dialog.setDetailedText(clean_details)
+        dialog.setStandardButtons(QMessageBox.Ok)
+        ok_button = dialog.button(QMessageBox.Ok)
+        if ok_button is not None:
+            ok_button.setText("确定")
+        dialog.exec()
 
     def _get_remote_sudo_passwords(self) -> Optional[Dict[str, str]]:
         passwords = dict(self.remote_sudo_passwords)
@@ -721,9 +951,20 @@ class MainWindow(QMainWindow):
         if layout_error:
             QMessageBox.warning(self, "Play", layout_error)
             return
-        if self.remote_measure_thread is not None:
+        if self.remote_measure_thread is not None or self.lifecycle_worker_thread is not None:
             return
+        sudo_passwords = self._get_remote_sudo_passwords()
+        if sudo_passwords is None:
+            return
+        self._start_lifecycle_operation(
+            "health",
+            context="run",
+            sudo_passwords=sudo_passwords,
+        )
 
+    def _begin_remote_play(self) -> None:
+        if self.is_playing or self.remote_measure_thread is not None:
+            return
         sudo_passwords = self._get_remote_sudo_passwords()
         if sudo_passwords is None:
             return
@@ -748,6 +989,7 @@ class MainWindow(QMainWindow):
         self.act_play.setIcon(self.icon_stop)
         self.act_local_play.setEnabled(False)
         self.act_deploy.setEnabled(False)
+        self.act_cleanup.setEnabled(False)
         self.act_step.setEnabled(False)
 
         self._prepare_remote_slice(self.remote_current_slice)
@@ -775,11 +1017,17 @@ class MainWindow(QMainWindow):
         self.act_step.setEnabled(True)
         if not self.deploy_completed:
             self.act_deploy.setEnabled(True)
+        self.act_cleanup.setEnabled(self.deploy_completed)
 
         if message:
             self.statusBar().showMessage(message)
             if not finished:
-                QMessageBox.warning(self, "Play", message)
+                self._show_result_dialog(
+                    QMessageBox.Warning,
+                    "远程运行已停止",
+                    "远程实验运行已停止，请检查详细信息。",
+                    message,
+                )
 
     def _on_remote_slice_tick(self) -> None:
         if not self.is_playing:
@@ -985,37 +1233,21 @@ class MainWindow(QMainWindow):
             current_time=self.current_time,
             redis_status=self._redis_status_text(),
         )
-        self._update_trend_panel(len(active_links))
+        self._update_trend_panel()
         self.statusBar().showMessage(
             f"卫星：{len(self.calculator.satellites)} | 活动链路：{len(active_links)}"
         )
 
-    def _update_trend_panel(self, active_link_count: int) -> None:
+    def _update_trend_panel(self) -> None:
         active_records = [
             self.registry.link_registry[key]
             for key in self.registry.active_link_keys
             if key in self.registry.link_registry
         ]
 
-        def numeric_values(field: str):
-            values = []
-            for record in active_records:
-                try:
-                    values.append(float(record.get(field)))
-                except (TypeError, ValueError):
-                    continue
-            return values
-
-        latencies = numeric_values("latency")
-        losses = numeric_values("redis_loss_pct")
-        total_links = len(self.registry.link_registry)
-        directed_active_count = self.registry.active_count
-
         self.trend_panel.update_metrics(
-            average_latency=sum(latencies) / len(latencies) if latencies else None,
-            availability=(directed_active_count / total_links) if total_links else None,
-            average_loss=sum(losses) / len(losses) if losses else None,
-            active_links=active_link_count,
+            loss_entries=ranked_metric_data(active_records, "redis_loss_pct"),
+            latency_entries=ranked_metric_data(active_records, "redis_delay_ms"),
         )
 
     def _redis_status_text(self) -> str:
@@ -1045,10 +1277,22 @@ class MainWindow(QMainWindow):
                 self.deploy_worker.cancel()
             self.deploy_worker_thread.quit()
             self.deploy_worker_thread.wait(2500)
+        if self.lifecycle_worker_thread is not None:
+            if self.lifecycle_worker is not None:
+                self.lifecycle_worker.cancel()
+            self.lifecycle_worker_thread.quit()
+            self.lifecycle_worker_thread.wait(2500)
         if self.export_worker_thread is not None:
             if self.export_worker is not None:
                 self.export_worker.cancel()
             self.export_worker_thread.quit()
             self.export_worker_thread.wait(2500)
+        if self.remote_deployment_owned:
+            cleanup_backends_sync(
+                self.remote_backends,
+                sudo_passwords=self.remote_sudo_passwords,
+                session_id=self.remote_session_id,
+            )
+            self.remote_deployment_owned = False
         self.visualizer.close()
         super().closeEvent(event)

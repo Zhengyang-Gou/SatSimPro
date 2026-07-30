@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import threading
@@ -18,6 +19,7 @@ from .config import (
     build_ssh_command,
     sudo_password_for_backend,
 )
+from .output_text import decode_external_output
 
 
 class RemoteDeployWorker(QObject):
@@ -30,12 +32,14 @@ class RemoteDeployWorker(QObject):
         *,
         backends: Optional[Sequence[RemoteBackend]] = None,
         sudo_passwords: Optional[Dict[str, str]] = None,
+        session_id: str = "",
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
         self.backends = tuple(backends or backend_configs_from_env())
         self.sudo_passwords = dict(sudo_passwords or {})
-        self._processes: Dict[str, subprocess.Popen[str]] = {}
+        self.session_id = session_id
+        self._processes: Dict[str, subprocess.Popen[bytes]] = {}
         self._process_lock = threading.Lock()
         self._cancelled = threading.Event()
 
@@ -82,7 +86,8 @@ class RemoteDeployWorker(QObject):
                 f"SATNET_BACKEND={backend.name} "
                 f"SATNET_ORBIT_START={backend.orbit_start} "
                 f"SATNET_ORBIT_END={backend.orbit_end} "
-                f"bash {backend.deploy_script}"
+                f"SATNET_SESSION_ID={shlex.quote(self.session_id)} "
+                f"bash {shlex.quote(backend.deploy_script)}"
             ),
             backend=backend,
         )
@@ -91,22 +96,20 @@ class RemoteDeployWorker(QObject):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             **self._popen_process_group_kwargs(),
         )
         with self._process_lock:
             self._processes[backend.name] = process
 
         try:
-            output, _ = process.communicate(input=f"{password}\n" if password else "\n")
+            password_input = f"{password}\n".encode("utf-8") if password else b"\n"
+            output_bytes, _ = process.communicate(input=password_input)
             returncode = process.returncode
         finally:
             with self._process_lock:
                 self._processes.pop(backend.name, None)
 
-        output = (output or "").strip()
+        output = decode_external_output(output_bytes)
         if self._cancelled.is_set():
             return backend.name, False, "已取消"
         if returncode == 0:
@@ -131,7 +134,7 @@ class RemoteDeployWorker(QObject):
             return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         return {"start_new_session": True}
 
-    def _terminate_process(self, process: subprocess.Popen[str]) -> None:
+    def _terminate_process(self, process: subprocess.Popen[bytes]) -> None:
         if process.poll() is not None:
             return
         if sys.platform.startswith("win"):

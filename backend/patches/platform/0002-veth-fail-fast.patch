@@ -1,0 +1,90 @@
+--- a/scripts/docker_ovs_setup_fast.py
++++ b/scripts/docker_ovs_setup_fast.py
+@@ -100,6 +100,14 @@
+     if not PID.isdigit() or int(PID) <= 0:
+         raise RuntimeError(f"container {CONTAINER_NAME} is not running: PID={PID!r}")
+ 
++    def checked_cmd(command, description):
++        result = run_cmd(command)
++        if result.returncode != 0:
++            message = result.stderr.decode(errors="replace").strip()
++            log(f"{description}: {message}", "ERROR")
++            raise RuntimeError(f"{description}: {message}")
++        return result
++
+     for j in range(0, VETH_PER_CONTAINER):
+         HOST_IF = f"{OVS_BRIDGE}{CONTAINER_ID}_{j}"
+         CONTAINER_IF = f"{CONTAINER_NAME}_{j}"
+@@ -110,16 +118,33 @@
+             in_container = run_cmd(
+                 f"docker exec {CONTAINER_NAME} ip link show {CONTAINER_IF}"
+             ).returncode == 0
+             on_host = run_cmd(f"ip link show {CONTAINER_IF}").returncode == 0
+-            if not in_container and on_host:
+-                run_cmd(f"ip link set {CONTAINER_IF} netns {PID}")
+-                run_cmd(f"nsenter -t {PID} -n ip link set {CONTAINER_IF} up")
+-            run_cmd(f"ip link set {HOST_IF} up")
+-            continue
++            if in_container:
++                checked_cmd(
++                    f"ip link set {HOST_IF} up",
++                    f"failed to bring up {HOST_IF}",
++                )
++                continue
++            if on_host:
++                checked_cmd(
++                    f"ip link set {CONTAINER_IF} netns {PID}",
++                    f"failed to move {CONTAINER_IF} into {CONTAINER_NAME}",
++                )
++                checked_cmd(
++                    f"nsenter -t {PID} -n ip link set {CONTAINER_IF} up",
++                    f"failed to bring up {CONTAINER_IF}",
++                )
++                checked_cmd(
++                    f"ip link set {HOST_IF} up",
++                    f"failed to bring up {HOST_IF}",
++                )
++                continue
++            # A host-side veth without either expected peer is unusable.
++            checked_cmd(f"ip link del {HOST_IF}", f"failed to delete stale {HOST_IF}")
+ 
+         # Repair a partially configured container left by an interrupted run.
+         run_cmd(f"docker exec {CONTAINER_NAME} ip link del {CONTAINER_IF}")
+         run_cmd(f"ip link del {HOST_IF}")
+         run_cmd(f"ip link del {CONTAINER_IF}")
+ 
+         if run_cmd(f"ip link add {CONTAINER_IF} type veth peer name {HOST_IF}").returncode != 0:
+@@ -127 +152 @@
+-            continue
++            raise RuntimeError(f"failed to create veth {CONTAINER_IF} <-> {HOST_IF}")
+@@ -129,3 +154,12 @@
+-        run_cmd(f"ip link set {CONTAINER_IF} netns {PID}")
+-        run_cmd(f"nsenter -t {PID} -n ip link set {CONTAINER_IF} up")
+-        run_cmd(f"ip link set {HOST_IF} up")
++        checked_cmd(
++            f"ip link set {CONTAINER_IF} netns {PID}",
++            f"failed to move {CONTAINER_IF} into {CONTAINER_NAME}",
++        )
++        checked_cmd(
++            f"nsenter -t {PID} -n ip link set {CONTAINER_IF} up",
++            f"failed to bring up {CONTAINER_IF}",
++        )
++        checked_cmd(
++            f"ip link set {HOST_IF} up",
++            f"failed to bring up {HOST_IF}",
++        )
+@@ -146,0 +180,11 @@
++def validate_host_interfaces(expected_ports):
++    missing = [
++        port
++        for port in expected_ports
++        if not os.path.exists(f"/sys/class/net/{port}")
++    ]
++    if missing:
++        preview = ", ".join(missing[:20])
++        raise RuntimeError(f"missing {len(missing)} host interfaces: {preview}")
++
++
+@@ -179,0 +224,2 @@
++    validate_host_interfaces(expected_ports)
++

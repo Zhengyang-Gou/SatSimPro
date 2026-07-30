@@ -1,0 +1,17 @@
+--- a/scripts/docker_ovs_setup_fast.py
++++ b/scripts/docker_ovs_setup_fast.py
+@@ -183,13 +183,13 @@
+-def main():
+ def validate_host_interfaces(expected_ports):
+     missing = [
+         port
+         for port in expected_ports
+         if not os.path.exists(f"/sys/class/net/{port}")
+     ]
+     if missing:
+         preview = ", ".join(missing[:20])
+         raise RuntimeError(f"missing {len(missing)} host interfaces: {preview}")
+ 
+ 
++def main():
+     os.makedirs(LOG_DIR, exist_ok=True)

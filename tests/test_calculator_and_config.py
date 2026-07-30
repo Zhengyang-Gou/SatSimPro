@@ -79,6 +79,14 @@ class ConfigTests(unittest.TestCase):
             "/home/s223/satnet-backend/scripts/deploy.sh",
         )
         self.assertEqual(
+            backends[0].health_script,
+            "/home/s223/satnet-backend/scripts/health.sh",
+        )
+        self.assertEqual(
+            backends[1].cleanup_script,
+            "/home/test/satnet-backend/scripts/cleanup.sh",
+        )
+        self.assertEqual(
             backends[1].measure_script,
             "/home/test/satnet-backend/scripts/measure_slice.sh",
         )

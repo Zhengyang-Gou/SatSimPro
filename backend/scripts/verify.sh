@@ -9,7 +9,10 @@ bash "$SCRIPT_DIR/status.sh"
 
 # Syntax-check stable entry points without performing deployment.
 bash -n "$SCRIPT_DIR/_common.sh"
+bash -n "$SCRIPT_DIR/apply_compat_patches.sh"
 bash -n "$SCRIPT_DIR/deploy.sh"
+bash -n "$SCRIPT_DIR/health.sh"
+bash -n "$SCRIPT_DIR/cleanup.sh"
 bash -n "$SCRIPT_DIR/measure_slice.sh"
 bash -n "$SCRIPT_DIR/status.sh"
 

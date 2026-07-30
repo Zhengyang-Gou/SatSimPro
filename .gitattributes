@@ -1,5 +1,6 @@
 # Linux backend entry points and sourced configuration must keep LF endings.
 *.sh text eol=lf
+*.patch text eol=lf
 backend/config/*.env text eol=lf
 backend/upstream/**/SOURCE text eol=lf
 

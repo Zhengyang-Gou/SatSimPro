@@ -1,0 +1,40 @@
+--- a/scripts/docker_ovs_setup_fast.py
++++ b/scripts/docker_ovs_setup_fast.py
+@@ -74,25 +74,33 @@ def create_container(group, index):
+     CONTAINER_NAME = f"S{CONTAINER_ID}"
+ 
+     if container_exists(CONTAINER_NAME):
+-        run_cmd(f"docker start {CONTAINER_NAME}")
++        result = run_cmd(f"docker start {CONTAINER_NAME}")
++        if result.returncode != 0:
++            message = result.stderr.decode(errors="replace").strip()
++            log(f"容器 {CONTAINER_NAME} 启动失败: {message}", "ERROR")
++            raise RuntimeError(f"failed to start {CONTAINER_NAME}: {message}")
+         log(f"容器 {CONTAINER_NAME} 已存在，检查并修复接口", "WARNING")
+     else:
+         result = run_cmd(
+         f"docker run -itd --name {CONTAINER_NAME} --privileged \
++        --network none \
+         --cpus={CPU_LIMIT} \
+         --memory={MEMORY_LIMIT} {IMAGE_NAME} sleep infinity"
+     )
+         if result.returncode != 0:
+-            log(f"容器 {CONTAINER_NAME} 启动失败", "ERROR")
+-            return
++            message = result.stderr.decode(errors="replace").strip()
++            log(f"容器 {CONTAINER_NAME} 启动失败: {message}", "ERROR")
++            raise RuntimeError(f"failed to create {CONTAINER_NAME}: {message}")
+ 
+         log(f"容器 {CONTAINER_NAME} 启动成功", "SUCCESS")
+ 
+     result = run_cmd(f"docker inspect -f '{{{{.State.Pid}}}}' {CONTAINER_NAME}")
+     if result.returncode != 0:
+         log(f"获取 {CONTAINER_NAME} PID 失败", "ERROR")
+-        return
++        raise RuntimeError(f"failed to inspect {CONTAINER_NAME}")
+     PID = result.stdout.decode().strip()
++    if not PID.isdigit() or int(PID) <= 0:
++        raise RuntimeError(f"container {CONTAINER_NAME} is not running: PID={PID!r}")
+ 
+     for j in range(0, VETH_PER_CONTAINER):
+         HOST_IF = f"{OVS_BRIDGE}{CONTAINER_ID}_{j}"

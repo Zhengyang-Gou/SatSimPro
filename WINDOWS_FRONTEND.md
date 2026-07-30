@@ -48,11 +48,15 @@ Each backend can be overridden independently:
 $env:SATNET_GZY0_SSH_HOST_ALIAS = "gzy0"
 $env:SATNET_GZY0_ORBIT_START = "1"
 $env:SATNET_GZY0_ORBIT_END = "30"
+$env:SATNET_GZY0_REMOTE_HEALTH_SCRIPT = "/home/s223/satnet-backend/scripts/health.sh"
+$env:SATNET_GZY0_REMOTE_CLEANUP_SCRIPT = "/home/s223/satnet-backend/scripts/cleanup.sh"
 $env:SATNET_GZY0_REMOTE_MEASURE_SCRIPT = "/home/s223/satnet-backend/scripts/measure_slice.sh"
 
 $env:SATNET_GZY1_SSH_HOST_ALIAS = "gzy1"
 $env:SATNET_GZY1_ORBIT_START = "31"
 $env:SATNET_GZY1_ORBIT_END = "60"
+$env:SATNET_GZY1_REMOTE_HEALTH_SCRIPT = "/home/test/satnet-backend/scripts/health.sh"
+$env:SATNET_GZY1_REMOTE_CLEANUP_SCRIPT = "/home/test/satnet-backend/scripts/cleanup.sh"
 $env:SATNET_GZY1_REMOTE_MEASURE_SCRIPT = "/home/test/satnet-backend/scripts/measure_slice.sh"
 python main.py
 ```
