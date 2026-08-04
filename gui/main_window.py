@@ -451,7 +451,7 @@ class MainWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self,
-            "清理远端环境",
+            "Remote Cleanup",
             "将停止远端接收进程，并删除卫星容器、OVS 网桥和运行状态。确定继续吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -616,7 +616,9 @@ class MainWindow(QMainWindow):
     ) -> None:
         dialog = QMessageBox(self)
         dialog.setIcon(icon)
-        dialog.setWindowTitle(title)
+        # The WSL window manager can corrupt non-ASCII native title text.  The
+        # localized explanation remains in the dialog body.
+        dialog.setWindowTitle("Satellite Simulation")
         dialog.setText(text)
         clean_details = sanitize_external_text(details)
         if clean_details:
@@ -639,7 +641,7 @@ class MainWindow(QMainWindow):
 
             password, ok = QInputDialog.getText(
                 self,
-                f"{backend.name} sudo 密码",
+                f"{backend.name} sudo Password",
                 (
                     f"请输入 {backend.name} "
                     f"({backend.ssh_username}@{backend.ssh_host}) 的 sudo 密码："
@@ -713,7 +715,7 @@ class MainWindow(QMainWindow):
         if total % planes != 0:
             QMessageBox.warning(
                 self,
-                "Walker 参数错误",
+                "Walker Parameters",
                 "卫星总数 (T) 必须能被轨道面数 (P) 整除。",
             )
             return
@@ -763,7 +765,7 @@ class MainWindow(QMainWindow):
     def open_step_settings(self) -> None:
         value, ok = QInputDialog.getDouble(
             self,
-            "设置步长",
+            "Step Size",
             "请输入每次推进的仿真步长，单位秒：",
             self.step_size,
             0.1,
@@ -778,7 +780,7 @@ class MainWindow(QMainWindow):
         if export_error:
             QMessageBox.warning(
                 self,
-                "导出数据集",
+                "Export Link Dataset",
                 export_error,
             )
             return
@@ -789,7 +791,7 @@ class MainWindow(QMainWindow):
 
         config = dlg.config()
         if not config["output_dir"]:
-            QMessageBox.warning(self, "导出数据集", "请选择输出目录。")
+            QMessageBox.warning(self, "Export Link Dataset", "请选择输出目录。")
             return
 
         self._start_link_dataset_export(config)
@@ -826,7 +828,7 @@ class MainWindow(QMainWindow):
             config["time_slices"],
             self,
         )
-        self.export_progress.setWindowTitle("导出链路状态数据集")
+        self.export_progress.setWindowTitle("Export Link Dataset")
         self.export_progress.setWindowModality(Qt.WindowModal)
         self.export_progress.setMinimumDuration(0)
 
@@ -864,14 +866,18 @@ class MainWindow(QMainWindow):
         if ok:
             QMessageBox.information(
                 self,
-                "导出数据集",
+                "Export Link Dataset",
                 (
                     f"已生成 {result.file_count} 个卫星文件，"
                     f"每个文件包含 {result.time_slices} 个时间片。\n\n{result.output_dir}"
                 ),
             )
         elif not was_cancelled:
-            QMessageBox.warning(self, "导出数据集", f"导出失败：\n{message}")
+            QMessageBox.warning(
+                self,
+                "Export Link Dataset",
+                f"导出失败：\n{message}",
+            )
 
     @Slot()
     def _cleanup_export_worker(self) -> None:
@@ -1219,7 +1225,10 @@ class MainWindow(QMainWindow):
         self.registry.apply_active_links(active_links)
         self._schedule_redis_update_if_needed()
         self._animation_frame += 1
-        if self._animation_frame % 3 == 0:
+        # A newly generated constellation renders one frame before either play
+        # mode starts. Refresh that frame immediately so the link table is not
+        # left empty until the animation reaches its third tick.
+        if not self.is_playing or self._animation_frame % 3 == 0:
             self._refresh_table()
 
         self.visualizer.update_scene(

@@ -62,6 +62,7 @@ class ConfigTests(unittest.TestCase):
         command = build_ssh_command("true", ssh_host_alias="")
         self.assertIn("BatchMode=yes", command)
         self.assertIn("ConnectTimeout=10", command)
+        self.assertIn("StrictHostKeyChecking=accept-new", command)
         self.assertIn("-p", command)
         self.assertTrue(command[-2].endswith("@121.48.163.223"))
         self.assertEqual(command[-1], "true")
@@ -72,8 +73,14 @@ class ConfigTests(unittest.TestCase):
             [(item.name, item.orbit_start, item.orbit_end) for item in backends],
             [("gzy0", 1, 30), ("gzy1", 31, 60)],
         )
-        self.assertEqual(build_ssh_command("true", backend=backends[0])[-2], "gzy0")
-        self.assertEqual(build_ssh_command("true", backend=backends[1])[-2], "gzy1")
+        self.assertEqual(
+            build_ssh_command("true", backend=backends[0])[-2],
+            "s223@121.48.163.223",
+        )
+        self.assertEqual(
+            build_ssh_command("true", backend=backends[1])[-2],
+            "test@121.48.163.234",
+        )
         self.assertEqual(
             backends[0].deploy_script,
             "/home/s223/satnet-backend/scripts/deploy.sh",

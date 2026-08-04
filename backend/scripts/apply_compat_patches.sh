@@ -52,3 +52,29 @@ fi
 
 python3 -m py_compile "$target"
 echo "compat_patch=python-syntax:ok"
+
+# Bridge deletion must complete before docker_ovs_setup_fast.py starts creating
+# replacement veth pairs. With --no-wait, OVS can remove an old port after the
+# setup worker has already observed and reused it, producing a deterministic
+# "Cannot find device" race during redeployment.
+deploy_target="$SATNET_PLATFORM_ROOT/scripts/deploy.sh"
+require_file "$deploy_target"
+if grep -Fq -- "ovs-vsctl --no-wait --if-exists del-br" "$deploy_target"; then
+    sed -i \
+        's/ovs-vsctl --no-wait --if-exists del-br/ovs-vsctl --if-exists del-br/' \
+        "$deploy_target"
+    echo "compat_patch=bridge-delete-wait:applied"
+else
+    echo "compat_patch=bridge-delete-wait:already-applied"
+fi
+
+receiver_target="$SATNET_PLATFORM_ROOT/scripts/start_receiver.sh"
+require_file "$receiver_target"
+if grep -Fq -- 'BASE="$OWNER_HOME/yzy"' "$receiver_target"; then
+    sed -i \
+        's|BASE="$OWNER_HOME/yzy"|BASE="${SATNET_PLATFORM_ROOT:-$OWNER_HOME/yzy}"|' \
+        "$receiver_target"
+    echo "compat_patch=receiver-integration-root:applied"
+else
+    echo "compat_patch=receiver-integration-root:already-applied"
+fi

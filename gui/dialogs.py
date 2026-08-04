@@ -52,7 +52,10 @@ def _dialog_buttons(dialog: QDialog) -> QDialogButtonBox:
 class WalkerDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setWindowTitle("生成 Walker 星座")
+        # Keep native window-manager titles ASCII-only.  Some WSL X servers
+        # misdecode non-ASCII title properties even though Qt widget text is
+        # rendered correctly inside the dialog.
+        self.setWindowTitle("Walker Constellation")
         self.setMinimumWidth(480)
         layout = QFormLayout(self)
         _configure_form_layout(layout)
@@ -96,7 +99,7 @@ class TopologyDialog(QDialog):
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("网络拓扑设置")
+        self.setWindowTitle("Topology Settings")
         self.setMinimumWidth(480)
 
         layout = QVBoxLayout(self)
@@ -129,7 +132,7 @@ class TopologyDialog(QDialog):
 class LinkDatasetExportDialog(QDialog):
     def __init__(self, constellation_config: Dict[str, Any], parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setWindowTitle("导出链路状态数据集")
+        self.setWindowTitle("Export Link Dataset")
         self.setMinimumWidth(520)
         self.path = ""
         self.constellation_config = dict(constellation_config)
@@ -223,7 +226,12 @@ class LinkDatasetExportDialog(QDialog):
         layout.addWidget(_dialog_buttons(self))
 
     def _select_directory(self) -> None:
-        directory = QFileDialog.getExistingDirectory(self)
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Output Directory",
+            "",
+            QFileDialog.DontUseNativeDialog | QFileDialog.ShowDirsOnly,
+        )
         if directory:
             self.path = directory
             self.lbl_path.setText(directory)

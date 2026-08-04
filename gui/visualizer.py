@@ -98,10 +98,11 @@ class Visualizer(QWidget):
         except Exception:
             pass
 
-        try:
-            self.plotter.enable_depth_peeling()
-        except Exception:
-            pass
+        # Do not enable depth peeling here.  With the VTK/OpenGL stack used by
+        # WSLg, combining it with MSAA makes translucent line actors disappear
+        # completely even though their geometry is present.  The Earth is
+        # opaque, so regular depth testing and alpha blending are sufficient
+        # for the semi-transparent ISL actors.
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

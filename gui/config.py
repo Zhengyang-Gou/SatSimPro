@@ -168,7 +168,7 @@ def backend_configs_from_env() -> List[RemoteBackend]:
             "gzy0",
             orbit_start=1,
             orbit_end=30,
-            ssh_host_alias="gzy0",
+            ssh_host_alias="",
             ssh_host="121.48.163.223",
             ssh_username="s223",
             home="/home/s223",
@@ -177,7 +177,7 @@ def backend_configs_from_env() -> List[RemoteBackend]:
             "gzy1",
             orbit_start=31,
             orbit_end=60,
-            ssh_host_alias="gzy1",
+            ssh_host_alias="",
             ssh_host="121.48.163.234",
             ssh_username="test",
             home="/home/test",
@@ -224,6 +224,7 @@ def build_ssh_command(
         "ssh",
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=accept-new",
     ]
 
     if alias:

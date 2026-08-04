@@ -35,7 +35,7 @@ class BackendLifecycleTests(unittest.TestCase):
             force=False,
         )
 
-        self.assertEqual(command[-2], "gzy0")
+        self.assertEqual(command[-2], "s223@121.48.163.223")
         self.assertIn("SATNET_EXPECT_SESSION_ID=session-123", command[-1])
         self.assertIn("SATNET_FORCE_CLEANUP=0", command[-1])
         self.assertIn(backend.cleanup_script, command[-1])
