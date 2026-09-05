@@ -3,6 +3,7 @@
 from typing import Any, Dict, List, Set
 
 from core.strategies import GridDeltaStrategy
+from core.metrics import MISSING, INVALID, ERROR, valid_metric
 
 from .link_state import (
     LinkKey,
@@ -128,11 +129,11 @@ class TopologyRegistry:
             "scope": "local" if src_host == tgt_host else "cross_host",
             "neighbor_order": neighbor_order,
             "latency": DOWN,
-            "redis_delay_ms": DOWN,
-            "redis_delay_ratio_pct": DOWN,
-            "redis_loss_pct": DOWN,
-            "_redis_delay_ratio_target": DOWN,
-            "_redis_loss_target": DOWN,
+            "redis_delay_ms": MISSING,
+            "redis_delay_ratio_pct": MISSING,
+            "redis_loss_pct": MISSING,
+            "_redis_delay_ratio_target": MISSING,
+            "_redis_loss_target": MISSING,
         }
 
     def apply_active_links(self, active_links: List[LinkRecord]) -> None:
@@ -201,13 +202,14 @@ class TopologyRegistry:
                 record["redis_loss_pct"] = DOWN
                 continue
 
-            delay_ms = redis_delay_map.get((record["src"], record["tgt"]), DOWN)
-            try:
-                measured_delay = round(float(delay_ms), 4)
-                target = round(measured_delay / float(record["latency"]) * 100.0, 4)
-            except (TypeError, ValueError, ZeroDivisionError):
-                measured_delay = DOWN
-                target = DOWN
+            measured_delay = valid_metric(redis_delay_map.get((record["src"], record["tgt"]), MISSING))
+            if isinstance(measured_delay, str):
+                target = measured_delay
+            else:
+                latency = valid_metric(record["latency"])
+                target = (round(measured_delay / latency * 100.0, 4)
+                          if isinstance(latency, float) and latency > 0 else INVALID)
+                measured_delay = round(measured_delay, 4)
             record["redis_delay_ms"] = measured_delay
             record["_redis_delay_ratio_target"] = target
             record["redis_delay_ratio_pct"] = self._smooth_metric(
@@ -225,29 +227,26 @@ class TopologyRegistry:
                 record["redis_loss_pct"] = DOWN
                 continue
 
-            target = redis_loss_map.get((record["src"], record["tgt"]), DOWN)
+            target = valid_metric(redis_loss_map.get((record["src"], record["tgt"]), MISSING), maximum=100.0)
             record["_redis_loss_target"] = target
             record["redis_loss_pct"] = self._smooth_metric(record.get("redis_loss_pct", DOWN), target)
 
     def _smooth_metric(self, current: Any, target: Any) -> Any:
-        if is_down(target):
-            return DOWN
-        if is_down(current):
+        target = valid_metric(target)
+        current = valid_metric(current)
+        if isinstance(target, str):
             return target
-
-        try:
-            current_f = float(current)
-            target_f = float(target)
-        except (TypeError, ValueError):
+        if isinstance(current, str):
             return target
+        current_f, target_f = current, target
 
         value = current_f + (target_f - current_f) * self.REDIS_SMOOTHING
         return round(value, 4)
 
-    def mark_redis_down(self) -> None:
+    def mark_redis_down(self, status=ERROR) -> None:
         for record in self.link_registry.values():
-            record["redis_delay_ms"] = DOWN
-            record["redis_delay_ratio_pct"] = DOWN
-            record["redis_loss_pct"] = DOWN
-            record["_redis_delay_ratio_target"] = DOWN
-            record["_redis_loss_target"] = DOWN
+            record["redis_delay_ms"] = status
+            record["redis_delay_ratio_pct"] = status
+            record["redis_loss_pct"] = status
+            record["_redis_delay_ratio_target"] = status
+            record["_redis_loss_target"] = status

@@ -50,3 +50,11 @@ The GUI uses three stable lifecycle commands on each backend:
 Manual cleanup is forced after confirmation in the GUI. Automatic cleanup on
 application exit includes the session ID and is refused by the backend if the
 active deployment belongs to a different session.
+
+The health command also reports `SATNET_MANIFEST` as one compact JSON line from
+`$SATNET_DATA_ROOT/manifest.json`. Install each exported `hosts/<host>/` package
+into that host's data root, including its manifest. The GUI validates the run ID,
+configuration digest, placement, and simulation parameters before remote play.
+Legacy datasets without experiment metadata remain visible to health/cleanup,
+but must be re-exported before remote playback. Update `scripts/health.sh` on
+both hosts when installing this version.

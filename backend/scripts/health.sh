@@ -61,6 +61,27 @@ if [[ ! -s "$SATNET_STATE_DIR/current_timeslice" ]] &&
     reasons+=("timeslice-state-absent")
 fi
 
+# Report only the manifest from the active controller data directory.
+# A missing legacy manifest does not hide resources from lifecycle cleanup;
+# the GUI refuses remote playback until versioned metadata is available.
+manifest_path="$SATNET_DATA_ROOT/manifest.json"
+if [[ -r "$manifest_path" ]]; then
+    if ! python3 - "$manifest_path" <<'PYMANIFEST'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        manifest = json.load(source)
+    print("SATNET_MANIFEST=" + json.dumps(manifest, separators=(",", ":"), allow_nan=False))
+except (OSError, ValueError) as exc:
+    print("invalid dataset manifest: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+PYMANIFEST
+    then
+        reasons+=("manifest-invalid")
+    fi
+fi
+
 printf 'SATNET_BACKEND=%s\n' "$SATNET_BACKEND"
 printf 'SATNET_SESSION_ID=%s\n' "$session_id"
 printf 'SATNET_CONTAINER_COUNT=%s\n' "$container_count"

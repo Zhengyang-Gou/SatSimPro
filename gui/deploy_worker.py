@@ -2,12 +2,7 @@
 
 from __future__ import annotations
 
-import os
-import signal
 import shlex
-import subprocess
-import sys
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -18,14 +13,16 @@ from .config import (
     backend_configs_from_env,
     build_ssh_command,
     sudo_password_for_backend,
+    env_float,
 )
 from .output_text import decode_external_output
+from .remote_process import RemoteProcessRunner
 
 
 class RemoteDeployWorker(QObject):
     """Run every backend deployment concurrently without blocking the GUI."""
 
-    finished = Signal(bool, str)
+    finished = Signal(bool, object, str)
 
     def __init__(
         self,
@@ -33,15 +30,16 @@ class RemoteDeployWorker(QObject):
         backends: Optional[Sequence[RemoteBackend]] = None,
         sudo_passwords: Optional[Dict[str, str]] = None,
         session_id: str = "",
+        timeout_sec: Optional[float] = None,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
         self.backends = tuple(backends or backend_configs_from_env())
         self.sudo_passwords = dict(sudo_passwords or {})
         self.session_id = session_id
-        self._processes: Dict[str, subprocess.Popen[bytes]] = {}
-        self._process_lock = threading.Lock()
-        self._cancelled = threading.Event()
+        self.timeout_sec = timeout_sec if timeout_sec is not None else env_float("SATNET_DEPLOY_TIMEOUT_SEC", 600.0, minimum=0.1)
+        self._runner = RemoteProcessRunner()
+        self._cancelled = self._runner.cancelled
 
     @Slot()
     def run(self) -> None:
@@ -62,7 +60,7 @@ class RemoteDeployWorker(QObject):
                     except Exception as exc:
                         results.append((name, False, str(exc)))
         except Exception as exc:
-            self.finished.emit(False, f"并行部署启动失败：{exc}")
+            self.finished.emit(False, {}, f"并行部署启动失败：{exc}")
             return
 
         results.sort(key=lambda item: item[0])
@@ -71,7 +69,9 @@ class RemoteDeployWorker(QObject):
             for name, ok, output in results
         )
         ok = bool(results) and all(result[1] for result in results) and not self._cancelled.is_set()
-        self.finished.emit(ok, message or "部署已取消")
+        details = {name: {"ok": success, "output": output, "session_id": self.session_id if success else ""}
+                   for name, success, output in results}
+        self.finished.emit(ok, details, message or "部署已取消")
 
     def _run_backend(self, backend: RemoteBackend) -> Tuple[str, bool, str]:
         if self._cancelled.is_set():
@@ -87,27 +87,16 @@ class RemoteDeployWorker(QObject):
                 f"SATNET_ORBIT_START={backend.orbit_start} "
                 f"SATNET_ORBIT_END={backend.orbit_end} "
                 f"SATNET_SESSION_ID={shlex.quote(self.session_id)} "
-                f"bash {shlex.quote(backend.deploy_script)}"
+                f"timeout --kill-after=2s {self.timeout_sec:g}s bash {shlex.quote(backend.deploy_script)}"
             ),
             backend=backend,
         )
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            **self._popen_process_group_kwargs(),
+        password_input = f"{password}\n".encode("utf-8") if password else b"\n"
+        completed = self._runner.run(
+            command, input=password_input, timeout=self.timeout_sec + 3.0,
         )
-        with self._process_lock:
-            self._processes[backend.name] = process
-
-        try:
-            password_input = f"{password}\n".encode("utf-8") if password else b"\n"
-            output_bytes, _ = process.communicate(input=password_input)
-            returncode = process.returncode
-        finally:
-            with self._process_lock:
-                self._processes.pop(backend.name, None)
+        output_bytes = completed.stdout
+        returncode = completed.returncode
 
         output = decode_external_output(output_bytes)
         if self._cancelled.is_set():
@@ -118,39 +107,8 @@ class RemoteDeployWorker(QObject):
 
     @Slot()
     def cancel(self) -> None:
-        self._cancelled.set()
-        with self._process_lock:
-            processes = list(self._processes.values())
-        for process in processes:
-            if process.poll() is None:
-                self._terminate_process(process)
+        self._runner.cancel()
 
     def _tail(self, output: str, limit: int = 6) -> str:
         lines = [line.strip() for line in output.splitlines() if line.strip()]
         return " | ".join(lines[-limit:])
-
-    def _popen_process_group_kwargs(self) -> dict:
-        if sys.platform.startswith("win"):
-            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        return {"start_new_session": True}
-
-    def _terminate_process(self, process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
-        if sys.platform.startswith("win"):
-            process.terminate()
-        else:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except Exception:
-                process.terminate()
-        try:
-            process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            if sys.platform.startswith("win"):
-                process.kill()
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except Exception:
-                    process.kill()

@@ -1,15 +1,17 @@
 """Main application window after modularizing UI, table, topology, and Redis concerns."""
 
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 from time import monotonic
 from typing import Any, Dict, Optional, Set
 from uuid import uuid4
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QMetaObject, QSize, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QInputDialog,
     QLineEdit,
@@ -22,6 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from core.calculator import OrbitCalculator
+from core.experiment import read_experiment_config, utc_text, validate_remote_experiments
 from core.strategies import GridDeltaStrategy
 
 from .config import (
@@ -35,7 +38,6 @@ from .config import (
 )
 from .backend_lifecycle_worker import (
     RemoteBackendLifecycleWorker,
-    cleanup_backends_sync,
 )
 from .deploy_worker import RemoteDeployWorker
 from .endpoint_delay_panel import EndToEndDelayPanel
@@ -58,7 +60,6 @@ from .visualizer import Visualizer
 
 class MainWindow(QMainWindow):
     redis_query_requested = Signal(int, int, object, object)
-    redis_close_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -85,6 +86,7 @@ class MainWindow(QMainWindow):
         self.redis_worker_thread: Optional[QThread] = None
         self.redis_worker: Optional[RedisQueryWorker] = None
         self._retiring_redis_threads: Set[QThread] = set()
+        self._retiring_redis_workers: Dict[QThread, RedisQueryWorker] = {}
         self.deploy_worker_thread: Optional[QThread] = None
         self.deploy_worker: Optional[RemoteDeployWorker] = None
         self.lifecycle_worker_thread: Optional[QThread] = None
@@ -95,7 +97,13 @@ class MainWindow(QMainWindow):
         self.export_progress: Optional[QProgressDialog] = None
         self.deploy_completed = False
         self.remote_session_id = uuid4().hex
-        self.remote_deployment_owned = False
+        self.owned_backend_names: Set[str] = set()
+        self._deployment_cleanup_candidates: Set[str] = set()
+        self._closing = False
+        self._close_ready = False
+        self._shutdown_cleanup_started = False
+        self._pending_remote_play = False
+        self._validated_remote_start = None
         self.remote_backend_details: Dict[str, Any] = {}
         self.remote_measure_thread: Optional[QThread] = None
         self.remote_measure_worker: Optional[RemoteMeasureSliceWorker] = None
@@ -116,6 +124,7 @@ class MainWindow(QMainWindow):
         self.current_time = datetime.utcnow()
         self.selected_link_pairs: Set[LinkKey] = set()
         self.current_walker_config: Optional[Dict[str, Any]] = None
+        self.current_dataset_identity = None
         self._animation_frame = 0
 
         self._init_ui()
@@ -138,22 +147,27 @@ class MainWindow(QMainWindow):
         self.redis_worker = RedisQueryWorker(redis_config)
         self.redis_worker.moveToThread(self.redis_worker_thread)
         self.redis_query_requested.connect(self.redis_worker.query)
-        self.redis_close_requested.connect(self.redis_worker.close)
         self.redis_worker.result_ready.connect(self._apply_redis_result)
         self.redis_worker.error.connect(self._handle_redis_error)
         self.redis_worker_thread.finished.connect(self.redis_worker.deleteLater)
         self.redis_worker_thread.finished.connect(self.redis_worker_thread.deleteLater)
         self.redis_worker_thread.finished.connect(
-            lambda thread=self.redis_worker_thread: self._retiring_redis_threads.discard(thread)
+            lambda thread=self.redis_worker_thread: (
+                self._retiring_redis_threads.discard(thread),
+                self._retiring_redis_workers.pop(thread, None),
+            )
         )
         self.redis_worker_thread.start()
 
-    def stop_redis_worker(self, *, wait: bool = False) -> None:
+    def stop_redis_worker(self) -> None:
         self.redis_query_seq += 1
         self.redis_query_in_flight = False
 
         worker = self.redis_worker
         thread = self.redis_worker_thread
+        if thread is not None:
+            self._retiring_redis_threads.add(thread)
+            self._retiring_redis_workers[thread] = worker
         self.redis_worker = None
         self.redis_worker_thread = None
 
@@ -163,22 +177,12 @@ class MainWindow(QMainWindow):
             except (TypeError, RuntimeError):
                 pass
             try:
-                self.redis_close_requested.emit()
+                QMetaObject.invokeMethod(worker, "close", Qt.QueuedConnection)
             except RuntimeError:
                 pass
-            try:
-                self.redis_close_requested.disconnect(worker.close)
-            except (TypeError, RuntimeError):
-                pass
 
-        if thread is not None:
-            self._retiring_redis_threads.add(thread)
-
-        # Normal enable/disable operations return immediately. During final
-        # application shutdown, wait briefly so a running QThread is not destroyed.
-        if wait and thread is not None and not thread.wait(2000):
-            thread.quit()
-            thread.wait(500)
+        # Retain threads until their queued close slot releases Redis/SSH and
+        # exits. Window shutdown polls completion without blocking Qt events.
 
     def _init_ui(self) -> None:
         central = QWidget()
@@ -224,6 +228,9 @@ class MainWindow(QMainWindow):
         self.act_generate_walker.triggered.connect(self.open_walker_gen)
 
         m_data.addAction(self.act_generate_walker)
+        self.act_load_dataset = QAction("载入数据集配置", self)
+        self.act_load_dataset.triggered.connect(self.open_dataset_config)
+        m_data.addAction(self.act_load_dataset)
 
         m_topo = mb.addMenu("拓扑")
         self.act_topology = QAction("拓扑设置", self)
@@ -375,7 +382,7 @@ class MainWindow(QMainWindow):
         self.remote_sudo_passwords = dict(sudo_passwords)
 
         self.deploy_completed = False
-        self.remote_deployment_owned = False
+        self._deployment_cleanup_candidates.update(b.name for b in self.remote_backends)
         self.act_deploy.setEnabled(False)
         self.act_cleanup.setEnabled(False)
         self.act_deploy.setText("Deploying...")
@@ -390,16 +397,23 @@ class MainWindow(QMainWindow):
         self.deploy_worker.moveToThread(self.deploy_worker_thread)
         self.deploy_worker_thread.started.connect(self.deploy_worker.run)
         self.deploy_worker.finished.connect(self._handle_deploy_finished)
-        self.deploy_worker.finished.connect(self.deploy_worker_thread.quit)
+        self.deploy_worker.finished.connect(self.deploy_worker_thread.quit, Qt.DirectConnection)
         self.deploy_worker_thread.finished.connect(self.deploy_worker.deleteLater)
         self.deploy_worker_thread.finished.connect(self._cleanup_deploy_worker)
         self.deploy_worker_thread.start()
 
-    @Slot(bool, str)
-    def _handle_deploy_finished(self, ok: bool, message: str) -> None:
+    @Slot(bool, object, str)
+    def _handle_deploy_finished(self, ok: bool, details: object, message: str) -> None:
+        details = details if isinstance(details, dict) else {}
+        self.remote_backend_details = details
+        self.owned_backend_names.update(
+            name for name, item in details.items()
+            if item.get("ok") and item.get("session_id") == self.remote_session_id
+        )
+        if self._closing:
+            return
         summary = self._deploy_message_summary(message)
         if ok:
-            self.remote_deployment_owned = True
             self.statusBar().showMessage("部署命令完成，正在校验远端运行状态...")
             self._start_lifecycle_operation(
                 "health",
@@ -408,7 +422,6 @@ class MainWindow(QMainWindow):
             )
         else:
             self.deploy_completed = False
-            self.remote_deployment_owned = False
             self.act_deploy.setText("Deploy")
             self.act_deploy.setEnabled(True)
             self.act_cleanup.setEnabled(True)
@@ -476,6 +489,7 @@ class MainWindow(QMainWindow):
         context: str,
         sudo_passwords: Optional[Dict[str, str]] = None,
         force: bool = False,
+        backends=None,
     ) -> None:
         if self.lifecycle_worker_thread is not None:
             return
@@ -491,7 +505,7 @@ class MainWindow(QMainWindow):
         self.lifecycle_worker_thread = QThread(self)
         self.lifecycle_worker = RemoteBackendLifecycleWorker(
             operation,
-            backends=self.remote_backends,
+            backends=self.remote_backends if backends is None else backends,
             sudo_passwords=sudo_passwords,
             session_id=self.remote_session_id,
             force=force,
@@ -499,7 +513,7 @@ class MainWindow(QMainWindow):
         self.lifecycle_worker.moveToThread(self.lifecycle_worker_thread)
         self.lifecycle_worker_thread.started.connect(self.lifecycle_worker.run)
         self.lifecycle_worker.finished.connect(self._handle_lifecycle_finished)
-        self.lifecycle_worker.finished.connect(self.lifecycle_worker_thread.quit)
+        self.lifecycle_worker.finished.connect(self.lifecycle_worker_thread.quit, Qt.DirectConnection)
         self.lifecycle_worker_thread.finished.connect(self.lifecycle_worker.deleteLater)
         self.lifecycle_worker_thread.finished.connect(self._cleanup_lifecycle_worker)
         self.lifecycle_worker_thread.start()
@@ -515,11 +529,23 @@ class MainWindow(QMainWindow):
         context = self.lifecycle_context
         self.remote_backend_details = dict(details) if isinstance(details, dict) else {}
         summary = self._deploy_message_summary(message)
+        for name, item in self.remote_backend_details.items():
+            if operation == "cleanup" and item.get("ok"):
+                self.owned_backend_names.discard(name)
+                self._deployment_cleanup_candidates.discard(name)
+            elif operation == "health" and item.get("session_id") == self.remote_session_id:
+                self.owned_backend_names.add(name)
+            elif operation == "health" and item.get("session_id"):
+                self.owned_backend_names.discard(name)
+        if self._closing:
+            if context == "shutdown" and not ok:
+                self._show_result_dialog(QMessageBox.Warning, "清理未完成",
+                                         "部分远端资源未能清理，请稍后检查。", summary)
+            return
 
         if operation == "cleanup":
             if ok:
                 self.deploy_completed = False
-                self.remote_deployment_owned = False
                 self.remote_backend_details = {}
                 self.act_deploy.setText("Deploy")
                 self.act_deploy.setEnabled(True)
@@ -548,13 +574,6 @@ class MainWindow(QMainWindow):
 
         self.deploy_completed = ok
         if ok:
-            sessions = {
-                str(item.get("session_id", ""))
-                for item in self.remote_backend_details.values()
-                if isinstance(item, dict)
-            }
-            if sessions == {self.remote_session_id}:
-                self.remote_deployment_owned = True
             self.act_deploy.setText("Deployed")
             self.act_deploy.setEnabled(False)
             self.act_cleanup.setEnabled(True)
@@ -567,7 +586,19 @@ class MainWindow(QMainWindow):
                     summary,
                 )
             elif context == "run":
-                QTimer.singleShot(0, self._begin_remote_play)
+                try:
+                    self._validated_remote_start = validate_remote_experiments(
+                        self.remote_backend_details, backends=self.remote_backends,
+                        walker=self.current_walker_config, strategy=self.strategy,
+                        step_duration_sec=self.remote_slice_duration_sec,
+                        time_slices=self.remote_total_slices,
+                        expected_identity=self.current_dataset_identity,
+                    )
+                except (ValueError, TypeError, KeyError) as exc:
+                    self._show_result_dialog(QMessageBox.Warning, "实验配置不一致",
+                                             "无法开始远程运行。", str(exc))
+                    return
+                self._pending_remote_play = True
         else:
             self.act_deploy.setText("Deploy")
             self.act_deploy.setEnabled(True)
@@ -599,6 +630,9 @@ class MainWindow(QMainWindow):
         self.lifecycle_worker_thread = None
         self.lifecycle_worker = None
         self.lifecycle_context = ""
+        if self._pending_remote_play and not self._closing:
+            self._pending_remote_play = False
+            self._begin_remote_play()
 
     def _deploy_message_summary(self, message: str) -> str:
         cleaned_message = sanitize_external_text(message)
@@ -701,6 +735,42 @@ class MainWindow(QMainWindow):
             active_count=self.registry.active_count,
         )
 
+    def open_dataset_config(self) -> None:
+        if self.is_playing:
+            QMessageBox.warning(self, "载入数据集配置", "请先停止仿真。")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "选择数据集清单", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as source:
+                self._load_dataset_config(json.load(source))
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            QMessageBox.warning(self, "载入数据集配置", str(exc))
+
+    def _load_dataset_config(self, manifest) -> None:
+        config = read_experiment_config(manifest)
+        epoch = datetime.fromisoformat(utc_text(config["epoch_time"])).replace(tzinfo=None)
+        start = datetime.fromisoformat(utc_text(config["start_time"])).replace(tzinfo=None)
+        total = config["orbit_num"] * config["sat_per_orbit"]
+        self.calculator.generate_walker(total, config["orbit_num"], config["phase_factor"],
+                                       config["altitude_km"], config["inclination_deg"], epoch)
+        self.strategy = GridDeltaStrategy(config["latitude_fuse_enabled"], config["latitude_threshold"])
+        self.current_walker_config = {
+            key: config[key] for key in ("orbit_num", "sat_per_orbit", "phase_factor",
+                                         "altitude_km", "inclination_deg")
+        }
+        self.current_walker_config.update(total=total, epoch_time=epoch)
+        self.current_dataset_identity = (manifest.get("run_id"), manifest["config_digest"])
+        self.current_time = start
+        self.remote_total_slices = config["time_slices"]
+        self.remote_slice_duration_sec = config["step_duration_sec"]
+        self.remote_slice_timer.setInterval(int(self.remote_slice_duration_sec * 1000))
+        self.reset_simulation_state()
+        self.act_local_play.setEnabled(True)
+        self.act_play.setEnabled(True)
+        self.loop(advance=False)
+
     def open_walker_gen(self) -> None:
         dlg = WalkerDialog(self)
         if dlg.exec() != QDialog.Accepted:
@@ -730,6 +800,7 @@ class MainWindow(QMainWindow):
         )
 
         if count:
+            self.current_dataset_identity = None
             self.current_walker_config = {
                 "total": total,
                 "orbit_num": planes,
@@ -757,6 +828,7 @@ class MainWindow(QMainWindow):
             latitude_fuse_enabled=dlg.chk_latitude_fuse.isChecked(),
             latitude_threshold=dlg.spin_latitude_threshold.value(),
         )
+        self.current_dataset_identity = None
 
         self.reset_simulation_state()
         if self.calculator.satellites:
@@ -838,7 +910,7 @@ class MainWindow(QMainWindow):
         self.export_worker_thread.started.connect(self.export_worker.run)
         self.export_worker.progress.connect(self._update_export_progress)
         self.export_worker.finished.connect(self._handle_export_finished)
-        self.export_worker.finished.connect(self.export_worker_thread.quit)
+        self.export_worker.finished.connect(self.export_worker_thread.quit, Qt.DirectConnection)
         self.export_worker_thread.finished.connect(self.export_worker.deleteLater)
         self.export_worker_thread.finished.connect(self._cleanup_export_worker)
         self.export_progress.canceled.connect(self._cancel_link_dataset_export)
@@ -857,6 +929,8 @@ class MainWindow(QMainWindow):
 
     @Slot(bool, object, str)
     def _handle_export_finished(self, ok: bool, result: Any, message: str) -> None:
+        if self._closing:
+            return
         if self.export_progress is not None:
             was_cancelled = self.export_progress.wasCanceled()
             self.export_progress.close()
@@ -969,7 +1043,7 @@ class MainWindow(QMainWindow):
         )
 
     def _begin_remote_play(self) -> None:
-        if self.is_playing or self.remote_measure_thread is not None:
+        if self._closing or self.is_playing or self.remote_measure_thread is not None:
             return
         sudo_passwords = self._get_remote_sudo_passwords()
         if sudo_passwords is None:
@@ -985,7 +1059,8 @@ class MainWindow(QMainWindow):
         self.remote_current_slice = 0
         self.remote_measure_in_flight = False
         self.remote_slice_active_links.clear()
-        self.remote_play_epoch_time = self.current_walker_config.get("epoch_time") if self.current_walker_config else self.current_time
+        self.remote_play_epoch_time = self._validated_remote_start
+        self.registry.reset(self.strategy)
         self.remote_play_started_at = monotonic()
         self.redis_last_error = ""
         self.redis_query_in_flight = False
@@ -997,6 +1072,10 @@ class MainWindow(QMainWindow):
         self.act_deploy.setEnabled(False)
         self.act_cleanup.setEnabled(False)
         self.act_step.setEnabled(False)
+        self.act_generate_walker.setEnabled(False)
+        self.act_load_dataset.setEnabled(False)
+        self.act_topology.setEnabled(False)
+        self.act_redis_enable.setEnabled(False)
 
         self._prepare_remote_slice(self.remote_current_slice)
         self._start_remote_measure(self.remote_current_slice)
@@ -1012,15 +1091,19 @@ class MainWindow(QMainWindow):
         if self.remote_measure_thread is not None:
             if self.remote_measure_worker is not None:
                 self.remote_measure_worker.cancel()
+            # Keep ownership until finished; cancel only sets a worker event.
             self.remote_measure_thread.quit()
-            self.remote_measure_thread.wait(5000)
-            self.remote_measure_thread = None
-            self.remote_measure_worker = None
 
         self.act_play.setText("远程运行")
         self.act_play.setIcon(self.icon_play)
         self.act_local_play.setEnabled(bool(self.calculator.satellites))
         self.act_step.setEnabled(True)
+        self.act_generate_walker.setEnabled(True)
+        self.act_load_dataset.setEnabled(True)
+        self.act_topology.setEnabled(True)
+        self.act_redis_enable.setEnabled(True)
+        self.redis_query_seq += 1
+        self.redis_query_in_flight = False
         if not self.deploy_completed:
             self.act_deploy.setEnabled(True)
         self.act_cleanup.setEnabled(self.deploy_completed)
@@ -1076,10 +1159,8 @@ class MainWindow(QMainWindow):
 
     def _start_remote_measure(self, time_slice: int) -> None:
         if self.remote_measure_thread is not None:
-            self.remote_measure_thread.quit()
-            self.remote_measure_thread.wait(1000)
-            self.remote_measure_thread = None
-            self.remote_measure_worker = None
+            self.stop_remote_play("上一时间片的测量线程尚未退出。")
+            return
 
         self.remote_measure_in_flight = True
         self.statusBar().showMessage(f"远程测量时间片 {time_slice}/{self.remote_total_slices - 1}")
@@ -1093,7 +1174,7 @@ class MainWindow(QMainWindow):
         self.remote_measure_worker.moveToThread(self.remote_measure_thread)
         self.remote_measure_thread.started.connect(self.remote_measure_worker.run)
         self.remote_measure_worker.finished.connect(self._handle_remote_measure_finished)
-        self.remote_measure_worker.finished.connect(self.remote_measure_thread.quit)
+        self.remote_measure_worker.finished.connect(self.remote_measure_thread.quit, Qt.DirectConnection)
         self.remote_measure_thread.finished.connect(self.remote_measure_worker.deleteLater)
         self.remote_measure_thread.finished.connect(self._cleanup_remote_measure_worker)
         self.remote_measure_thread.start()
@@ -1269,39 +1350,48 @@ class MainWindow(QMainWindow):
         return "空闲"
 
     def closeEvent(self, event) -> None:
+        if self._close_ready:
+            self.visualizer.close()
+            super().closeEvent(event)
+            return
+        event.ignore()
+        if self._closing:
+            return
+        self._closing = True
+        self.is_playing = False
         self.timer.stop()
         self.remote_slice_timer.stop()
-        if self.remote_measure_thread is not None:
-            if self.remote_measure_worker is not None:
-                self.remote_measure_worker.cancel()
-            self.remote_measure_thread.quit()
-            self.remote_measure_thread.wait(2500)
-        self.stop_redis_worker(wait=True)
-        for thread in tuple(self._retiring_redis_threads):
-            if thread.isRunning():
-                thread.quit()
-                thread.wait(500)
-        if self.deploy_worker_thread is not None:
-            if self.deploy_worker is not None:
-                self.deploy_worker.cancel()
-            self.deploy_worker_thread.quit()
-            self.deploy_worker_thread.wait(2500)
-        if self.lifecycle_worker_thread is not None:
-            if self.lifecycle_worker is not None:
-                self.lifecycle_worker.cancel()
-            self.lifecycle_worker_thread.quit()
-            self.lifecycle_worker_thread.wait(2500)
-        if self.export_worker_thread is not None:
-            if self.export_worker is not None:
-                self.export_worker.cancel()
-            self.export_worker_thread.quit()
-            self.export_worker_thread.wait(2500)
-        if self.remote_deployment_owned:
-            cleanup_backends_sync(
-                self.remote_backends,
-                sudo_passwords=self.remote_sudo_passwords,
-                session_id=self.remote_session_id,
-            )
-            self.remote_deployment_owned = False
-        self.visualizer.close()
-        super().closeEvent(event)
+        self.menuBar().setEnabled(False)
+        for toolbar in self.findChildren(QToolBar):
+            toolbar.setEnabled(False)
+        self.statusBar().showMessage("正在结束后台任务并清理本会话资源...")
+        for worker in (self.remote_measure_worker, self.deploy_worker,
+                       self.lifecycle_worker, self.export_worker):
+            if worker is not None:
+                worker.cancel()
+        self.stop_redis_worker()
+        self._shutdown_timer = QTimer(self)
+        self._shutdown_timer.timeout.connect(self._poll_shutdown)
+        self._shutdown_timer.start(50)
+
+    def _poll_shutdown(self) -> None:
+        # Cleanup slots release references only after QThread.finished. Waiting
+        # for those slots also ensures deployment results have been recorded.
+        if any(thread is not None for thread in (
+            self.remote_measure_thread, self.deploy_worker_thread,
+            self.lifecycle_worker_thread, self.export_worker_thread,
+        )) or self._retiring_redis_threads:
+            return
+        if not self._shutdown_cleanup_started:
+            self._shutdown_cleanup_started = True
+            names = self.owned_backend_names | self._deployment_cleanup_candidates
+            backends = [b for b in self.remote_backends if b.name in names]
+            if backends:
+                self._start_lifecycle_operation(
+                    "cleanup", context="shutdown", backends=backends,
+                    sudo_passwords=self.remote_sudo_passwords,
+                )
+                return
+        self._shutdown_timer.stop()
+        self._close_ready = True
+        self.close()

@@ -34,7 +34,8 @@ class Strategy:
                 'tgt': tgt,
                 'src_name': satellites[src].name,
                 'tgt_name': satellites[tgt].name,
-                'latency': round(float(latencies[i]), 4)
+                'latency': round(float(latencies[i]), 4),
+                'latency_ms_raw': float(latencies[i])
             })
 
         return isl_arr, link_stats

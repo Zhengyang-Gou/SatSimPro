@@ -6,7 +6,7 @@ from PySide6.QtCore import QObject, QRect, Qt
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 
-from .link_state import is_down
+from core.metrics import STATUS_TEXT, valid_metric
 
 DOWN_TEXT = "中断"
 
@@ -21,8 +21,8 @@ class BarDelegate(QStyledItemDelegate):
         self.decimals = decimals
 
     def paint(self, painter: QPainter, option, index) -> None:
-        data = index.data(Qt.EditRole)
-        value_is_down = data is None or is_down(data)
+        data = valid_metric(index.data(Qt.EditRole))
+        value_is_down = isinstance(data, str)
 
         painter.save()
         painter.setPen(Qt.NoPen)
@@ -36,7 +36,7 @@ class BarDelegate(QStyledItemDelegate):
         if value_is_down:
             ratio = 1.0
             color = QColor("#5f2d32")
-            text = DOWN_TEXT
+            text = STATUS_TEXT[data]
         else:
             try:
                 value = float(data)

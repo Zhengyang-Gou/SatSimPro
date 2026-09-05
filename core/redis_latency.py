@@ -3,6 +3,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import redis
 
+from .metrics import DOWN, MISSING, INVALID, ERROR, valid_metric
+
 try:
     from sshtunnel import SSHTunnelForwarder
 except Exception:  # sshtunnel is optional until SSH mode is enabled.
@@ -54,7 +56,11 @@ class RedisLatencyProvider:
         self.tunnel = None
         self.client: Optional[redis.Redis] = None
 
-        self._connect()
+        try:
+            self._connect()
+        except Exception:
+            self.close()
+            raise
 
     def _connect(self) -> None:
         connect_host = self.host
@@ -153,24 +159,21 @@ class RedisLatencyProvider:
         return [f"{self.key_prefix}:{src_id}:{tgt_id}:{metric}"]
 
     def _parse_metric_value(self, raw):
-        if not raw:
-            return "down"
-
-        try:
-            value = float(str(raw).rsplit(",", 1)[-1])
-            return round(value, 4)
-        except Exception:
-            return "down"
+        if raw is None or raw == "":
+            return MISSING
+        value = valid_metric(str(raw).rsplit(",", 1)[-1])
+        return round(value, 4) if isinstance(value, float) else value
 
     def _parse_loss_pct(self, raw):
-        if not raw:
-            return "down"
-
-        try:
-            value = float(str(raw).split(",")[-1])
-            return round((value / self.loss_scale) * 100.0, 4)
-        except Exception:
-            return "down"
+        value = self._parse_metric_value(raw)
+        if isinstance(value, str):
+            return value
+        scale = valid_metric(self.loss_scale)
+        if not isinstance(scale, float) or scale <= 0:
+            return INVALID
+        # Validate before rounding so a value just outside the range is rejected.
+        value = valid_metric(str(raw).rsplit(",", 1)[-1], maximum=scale)
+        return round(value / scale * 100.0, 4) if isinstance(value, float) else value
 
     def _get_latest_many(
         self,
@@ -217,7 +220,7 @@ class RedisLatencyProvider:
 
         if redis_results is None:
             for link in links:
-                result[(link["src"], link["tgt"])] = "down"
+                result[(link["src"], link["tgt"])] = ERROR
             return result
 
         pos = 0
@@ -225,7 +228,7 @@ class RedisLatencyProvider:
             latest_result = redis_results[pos]
             pos += 1
 
-            latest = "down"
+            latest = MISSING
             if latest_result:
                 latest = parser(latest_result[-1])
 
@@ -309,11 +312,11 @@ class RedisLatencyProvider:
                 raise RuntimeError(f"Redis批量查询失败：{last_error}") from last_error
             for metric, _parser in metric_specs:
                 for link in links:
-                    metrics[metric][(int(link["src"]), int(link["tgt"]))] = "down"
+                    metrics[metric][(int(link["src"]), int(link["tgt"]))] = ERROR
             return metrics
 
         for result, (metric, parser, src_idx, tgt_idx) in zip(redis_results, query_plan):
-            value = parser(result[-1]) if result else "down"
+            value = parser(result[-1]) if result else MISSING
             metrics[metric][(src_idx, tgt_idx)] = value
         return metrics
 
@@ -454,7 +457,7 @@ class MultiRedisLatencyProvider:
                 for metric, values in result.items():
                     destination = merged.setdefault(metric, {})
                     for key, value in values.items():
-                        if destination.get(key, "down") == "down" and value != "down":
+                        if destination.get(key, MISSING) in (DOWN, MISSING) and isinstance(value, (int, float)):
                             destination[key] = value
 
         self._mark_down(merged, unassigned)
@@ -489,7 +492,7 @@ class MultiRedisLatencyProvider:
         for link in links:
             key = (int(link["src"]), int(link["tgt"]))
             for values in result.values():
-                values[key] = "down"
+                values[key] = ERROR
 
     def test_connection(self) -> Tuple[bool, str]:
         results = []

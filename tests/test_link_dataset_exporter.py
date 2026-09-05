@@ -3,12 +3,45 @@ import json
 import re
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime
 
 from core.link_dataset_exporter import LinkDatasetExporter
 
 
 class LinkDatasetExporterTests(unittest.TestCase):
+    def test_export_reuses_unrounded_strategy_latency_and_records_experiment(self):
+        from core.experiment import config_digest
+        from core.calculator import OrbitCalculator
+        from core.strategies import GridDeltaStrategy
+        import numpy as np
+
+        epoch = datetime(2026, 1, 1)
+        calculator = OrbitCalculator()
+        calculator.generate_walker(9, 3, 1, 550, 53, epoch)
+        calculator.propagate(epoch)
+        strategy = GridDeltaStrategy()
+        _, links = strategy.compute_links(calculator.satellites)
+        exporter = LinkDatasetExporter()
+        with patch.object(exporter, "_latency_ms", side_effect=AssertionError("recomputed distance")):
+            latencies = exporter._active_latency_map(links, calculator.satellites)
+            for link in links:
+                key = exporter._link_key(link["src"], link["tgt"])
+                expected = np.linalg.norm(calculator.satellites[key[0]].position
+                                          - calculator.satellites[key[1]].position) / 299792.458 * 1000
+                self.assertAlmostEqual(latencies[key], expected, places=12)
+            with tempfile.TemporaryDirectory() as directory:
+                result = exporter.export(orbit_num=3, sat_per_orbit=3, time_slices=2,
+                    duration_sec=20, output_dir=directory, phase_factor=1, start_time=epoch)
+                with open(os.path.join(result.output_dir, "manifest.json")) as source:
+                    root = json.load(source)
+                with open(os.path.join(result.host_output_dirs["gzy0"], "manifest.json")) as source:
+                    host = json.load(source)
+                self.assertEqual(root["experiment"], host["experiment"])
+                self.assertEqual(root["run_id"], host["run_id"])
+                self.assertEqual(root["config_digest"], config_digest(root["experiment"]))
+                self.assertEqual(root["experiment"]["phase_factor"], 1)
+
     def test_export_writes_link_info_mapping_file(self):
         with tempfile.TemporaryDirectory() as parent_dir:
             result = LinkDatasetExporter().export(

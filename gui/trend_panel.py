@@ -1,6 +1,6 @@
 """Redis-backed link metric rankings shown beside the globe."""
 
-from math import floor, log10
+from math import floor, log10, isfinite
 from typing import Any, Dict, List, Sequence, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt
@@ -27,6 +27,8 @@ def ranked_metric_data(
         try:
             value = float(raw_value)
         except (TypeError, ValueError):
+            continue
+        if not isfinite(value) or value < 0:
             continue
         values.append((str(record.get("id", "未知链路")), value))
 
@@ -179,7 +181,7 @@ class RankingBarChart(QWidget):
 
     @staticmethod
     def _nice_axis_max(maximum: float) -> float:
-        if maximum <= 0:
+        if not isfinite(maximum) or maximum <= 0:
             return 1.0
         raw = maximum * 1.15
         magnitude = 10 ** floor(log10(raw))

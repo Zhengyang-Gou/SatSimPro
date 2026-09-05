@@ -14,6 +14,7 @@ import numpy as np
 from link_info import generate_link_info
 
 from .calculator import OrbitCalculator
+from .experiment import experiment_config, config_digest
 from .placement import DEFAULT_HOST_ORBIT_RANGES, host_for_satellite, normalize_host_ranges
 from .strategies import GridDeltaStrategy
 
@@ -125,6 +126,17 @@ class LinkDatasetExporter:
         run_id = current_time.strftime("%Y%m%d_%H%M%S")
         walker_epoch_time = epoch_time or current_time
         strategy = strategy or GridDeltaStrategy()
+        experiment = experiment_config(
+            orbit_num=orbit_num, sat_per_orbit=sat_per_orbit,
+            phase_factor=phase_factor, altitude_km=altitude_km,
+            inclination_deg=inclination_deg, epoch_time=walker_epoch_time,
+            start_time=current_time, step_duration_sec=duration_sec / time_slices,
+            time_slices=time_slices, strategy=strategy,
+            random_failure_enabled=random_failure_enabled,
+            failure_probability=failure_probability, random_seed=random_seed,
+        )
+        metadata = {"run_id": run_id, "experiment": experiment,
+                    "config_digest": config_digest(experiment)}
         calculator = OrbitCalculator()
         calculator.generate_walker(
             orbit_num * sat_per_orbit,
@@ -289,6 +301,7 @@ class LinkDatasetExporter:
             self._write_json(
                 os.path.join(host_root, "manifest.json"),
                 {
+                    **metadata,
                     "host": host_name,
                     "orbit_start": host_range["orbit_start"],
                     "orbit_end": host_range["orbit_end"],
@@ -310,14 +323,14 @@ class LinkDatasetExporter:
         self._write_json(
             manifest_path,
             {
-                "run_id": run_id,
+                **metadata,
                 "topology": topology_name,
                 "orbit_num": orbit_num,
                 "sat_per_orbit": sat_per_orbit,
                 "step_duration_sec": step_seconds,
                 "time_slices": time_slices,
-                    "host_ranges": list(normalized_host_ranges),
-                    "bridge_by_host": bridge_by_host,
+                "host_ranges": list(normalized_host_ranges),
+                "bridge_by_host": bridge_by_host,
             },
         )
 
@@ -485,10 +498,11 @@ class LinkDatasetExporter:
         for link in active_links:
             src = int(link["src"])
             tgt = int(link["tgt"])
-            active_latency[self._link_key(src, tgt)] = self._latency_ms(
-                satellites[src].position,
-                satellites[tgt].position,
-            )
+            latency = link.get("latency_ms_raw")
+            if latency is None:
+                # Third-party strategies may not yet expose unrounded values.
+                latency = self._latency_ms(satellites[src].position, satellites[tgt].position)
+            active_latency[self._link_key(src, tgt)] = float(latency)
         return active_latency
 
     def _latency_ms(self, src_position: np.ndarray, tgt_position: np.ndarray) -> float:

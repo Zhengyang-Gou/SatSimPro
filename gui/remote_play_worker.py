@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import os
-import signal
-import subprocess
-import sys
-import threading
+import shlex
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -24,6 +20,7 @@ from .config import (
     sudo_password_for_backend,
 )
 from .output_text import decode_external_output
+from .remote_process import RemoteProcessRunner
 
 
 class RemoteMeasureSliceWorker(QObject):
@@ -51,9 +48,8 @@ class RemoteMeasureSliceWorker(QObject):
         self.timeout_sec = float(timeout_sec)
         self.probe_lead_sec = float(probe_lead_sec)
         self.sudo_passwords = dict(sudo_passwords or {})
-        self._processes: Dict[str, subprocess.Popen[bytes]] = {}
-        self._process_lock = threading.Lock()
-        self._cancelled = threading.Event()
+        self._runner = RemoteProcessRunner()
+        self._cancelled = self._runner.cancelled
         self.probe_start_epoch_ms = 0
 
     @Slot()
@@ -108,36 +104,18 @@ class RemoteMeasureSliceWorker(QObject):
             f"SATNET_ORBIT_START={backend.orbit_start} "
             f"SATNET_ORBIT_END={backend.orbit_end} "
             f"SATNET_PROBE_START_EPOCH_MS={self.probe_start_epoch_ms} "
-            f"timeout {self.timeout_sec:g}s "
-            f"bash {backend.measure_script} "
+            f"timeout --kill-after=2s {self.timeout_sec:g}s "
+            f"bash {shlex.quote(backend.measure_script)} "
             f"{self.time_slice} {self.probe_count} {self.probe_pps:g} "
             f"{self.probe_start_epoch_ms}"
         )
         command = build_ssh_command(remote_command, backend=backend)
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            **self._popen_process_group_kwargs(),
+        password_input = f"{password}\n".encode("utf-8") if password else b"\n"
+        completed = self._runner.run(
+            command, input=password_input, timeout=self.timeout_sec + 3.0,
         )
-        with self._process_lock:
-            self._processes[backend.name] = process
-
-        try:
-            password_input = f"{password}\n".encode("utf-8") if password else b"\n"
-            output_bytes, _ = process.communicate(
-                input=password_input,
-                timeout=self.timeout_sec + 1.0,
-            )
-            returncode = process.returncode
-        except subprocess.TimeoutExpired as exc:
-            self._terminate_process(process)
-            output = decode_external_output(exc.stdout)
-            return backend.name, False, (output or f"超过 {self.timeout_sec:g}s").strip()
-        finally:
-            with self._process_lock:
-                self._processes.pop(backend.name, None)
+        output_bytes = completed.stdout
+        returncode = completed.returncode
 
         output = decode_external_output(output_bytes)
         if self._cancelled.is_set():
@@ -148,39 +126,8 @@ class RemoteMeasureSliceWorker(QObject):
 
     @Slot()
     def cancel(self) -> None:
-        self._cancelled.set()
-        with self._process_lock:
-            processes = list(self._processes.values())
-        for process in processes:
-            if process.poll() is None:
-                self._terminate_process(process)
+        self._runner.cancel()
 
     def _tail(self, output: str, limit: int = 4) -> str:
         lines = [line.strip() for line in output.splitlines() if line.strip()]
         return " | ".join(lines[-limit:])
-
-    def _popen_process_group_kwargs(self) -> dict:
-        if sys.platform.startswith("win"):
-            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        return {"start_new_session": True}
-
-    def _terminate_process(self, process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
-        if sys.platform.startswith("win"):
-            process.terminate()
-        else:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except Exception:
-                process.terminate()
-        try:
-            process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            if sys.platform.startswith("win"):
-                process.kill()
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except Exception:
-                    process.kill()

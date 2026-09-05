@@ -37,7 +37,9 @@ class RedisQueryWorker(QObject):
 
     @Slot()
     def close(self) -> None:
-        if self.provider is not None:
-            self.provider.close()
+        try:
+            if self.provider is not None:
+                self.provider.close()
+        finally:
             self.provider = None
-        QThread.currentThread().quit()
+            QThread.currentThread().quit()
